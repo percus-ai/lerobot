@@ -14,9 +14,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .config import RobotConfig
-from .robot import Robot
-from .utils import make_robot_from_config
-
-# Import robot modules to register them with draccus ChoiceRegistry
-from . import mujoco_sim
+from .config_mujoco_sim import MuJoCoSimConfig
+from .mujoco_sim import MuJoCoSim
