@@ -56,6 +56,9 @@ class SmolVlaAttentionContext:
         self.policy = policy
         self._enabled = False
         self._call_id = 0
+        self._chunk_id = 0
+        self._step = 0
+        self._last_attn_obj_id: int | None = None
 
     def enable(self) -> None:
         if self._enabled:
@@ -284,20 +287,36 @@ class SmolVlaAttentionContext:
         if not torch.isfinite(attn).all():
             return []
 
+        attn_obj_id = id(attn)
+        if attn_obj_id != self._last_attn_obj_id:
+            self._last_attn_obj_id = attn_obj_id
+            self._chunk_id += 1
+            self._step = 0
+
         self._call_id += 1
-        attn_b = attn[0].to(dtype=torch.float32)
-        attn_mean = attn_b.mean(0)
+        attn_b = attn[0].to(dtype=torch.float32)     # (heads, q, k)
+        attn_mean = attn_b.mean(0)                   # (q, k)
 
-        q_mask = getattr(model, "_attn_query_mask", None)
-        q_idxs: np.ndarray | None = None
-        if isinstance(q_mask, torch.Tensor) and q_mask.ndim == 2 and q_mask.shape[0] >= 1:
-            q_idxs_np = torch.where(q_mask[0].to(dtype=torch.bool))[0].detach().cpu().numpy()
-            if q_idxs_np.size > 0:
-                q_idxs = q_idxs_np
+        q_len = int(attn_mean.shape[0])
 
-        q_idx = int(q_idxs[-1]) if q_idxs is not None else int(attn_mean.shape[0] - 1)
-        q_idx = max(0, min(q_idx, attn_mean.shape[0] - 1))
+        # SmolVLAは policy が n_action_steps 分をキューで返すので,
+        # 可視化もその範囲で per-step にする.
+        n_action_steps = int(getattr(policy.config, "n_action_steps", 1) or 1)
+        max_steps = max(1, min(n_action_steps, q_len))
+
+        q_idx = int(min(self._step, max_steps - 1))
         q_row = attn_mean[q_idx]
+
+        if _attn_debug_enabled():
+            logging.info(
+                "[attn][smolvla] call_id=%d chunk_id=%d step=%d q_idx=%d q_len=%d k_len=%d",
+                self._call_id,
+                int(self._chunk_id),
+                int(self._step),
+                int(q_idx),
+                int(q_len),
+                int(attn_mean.shape[1]),
+            )
 
         samples: list[AttentionSample] = []
         if _attn_debug_enabled():
@@ -365,6 +384,9 @@ class SmolVlaAttentionContext:
                 )
             )
 
+        if max_steps > 1:
+            self._step = min(self._step + 1, max_steps - 1)
+
         return samples
 
 
@@ -396,6 +418,7 @@ class PiAttentionContext:
         self._chunk_gap_s = 0.35  # chunk生成間は >1s 程度になる想定, 生成中は <0.1s 程度
         self._pending_new_version = True
         self._best_score_in_group = -1e18
+        self._last_pkv_id: int | None = None
 
     @staticmethod
     def _entropy_score(img_slice: torch.Tensor, eps: float = 1e-9) -> tuple[float, float, float]:
@@ -543,15 +566,28 @@ class PiAttentionContext:
             if not attn_layers:
                 return out
 
-            # ---- chunk生成の forward 群をまとめる (時間ギャップで切る) ----
+            # ---- chunk境界検出: time gapではなく past_key_values の identity を使う ----
+            pkv = kwargs.get("past_key_values", None)
+            pkv_id = id(pkv) if pkv is not None else None
+
             now = time.monotonic()
-            if (now - self._last_forward_ts) > self._chunk_gap_s:
-                # 新しい chunk 生成が始まったとみなす
+            new_chunk = False
+            if pkv_id is not None:
+                if self._last_pkv_id is None or pkv_id != self._last_pkv_id:
+                    new_chunk = True
+                self._last_pkv_id = pkv_id
+            else:
+                # 何らかの理由で past_key_values が渡らない経路の保険
+                if (now - self._last_forward_ts) > self._chunk_gap_s:
+                    new_chunk = True
+
+            if new_chunk:
                 self._pending_new_version = True
                 self._best_score_in_group = -1e18
-                # shape ロックは chunk 毎にやり直す (π0 で shape が変わるケースの対策)
+                # chunk毎にshapeロックをやり直す
                 model._attn_expected_q_len = None
                 model._attn_expected_k_len = None
+
             self._last_forward_ts = now
 
             a_last = attn_layers[-1]
@@ -574,18 +610,33 @@ class PiAttentionContext:
                 self._suppressed += 1
                 return out
 
+            policy_name = getattr(self.policy, "name", "pi")
+            is_pi0 = policy_name == "pi0"
+
+            # π0は suffix の先頭が state token なので, q=0 を action として扱わない
+            q_offset = 1 if is_pi0 else 0
+
             rtc = getattr(self.policy.config, "rtc_config", None)
             exec_h = int(getattr(rtc, "execution_horizon", 0) or 0) if rtc is not None else 0
             if exec_h <= 0:
-                exec_h = 10
-            q1 = min(q_len, max(1, exec_h))
+                exec_h = int(getattr(self.policy.config, "n_action_steps", 0) or 0) or 10
+
+            available_q = q_len - q_offset
+            if available_q <= 0:
+                self._suppressed += 1
+                return out
+
+            # 「可視化対象にするaction tokenの数」
+            q1 = min(available_q, max(1, exec_h))
+            q_start = q_offset
+            q_end = q_offset + q1  # Python sliceのend
 
             expected_q = getattr(model, "_attn_expected_q_len", None)
             expected_k = getattr(model, "_attn_expected_k_len", None)
 
             # chunk内での shape 外れ値だけ捨てる
             if expected_q is None or expected_k is None:
-                if q_len < q1 or img1 > k_len:
+                if q_len < q_end or img1 > k_len:
                     self._suppressed += 1
                     return out
                 model._attn_expected_q_len = int(q_len)
@@ -606,14 +657,16 @@ class PiAttentionContext:
                     )
                 return out
 
-            policy_name = getattr(self.policy, "name", "pi")
-            use_entropy_score = policy_name == "pi0"  # π0 は “尖り” を重視して選ぶ
+            # π0もπ0.5と同じ基準で「画像へのmassが大きいlayer」を採用する
+            # (以前のentropy基準が欲しければ環境変数で戻せるようにする)
+            use_entropy_score = False
+            if is_pi0:
+                use_entropy_score = os.environ.get("LEROBOT_PI0_ATTN_SCORE", "mass").lower() == "entropy"
 
             best_layer = None
             best_mass = -1.0
             best_score = -1e18
 
-            # 各レイヤーで “画像への注目度” を評価して最良を選ぶ
             for li, a in enumerate(attn_layers):
                 if not isinstance(a, torch.Tensor) or a.ndim != 4 or a.shape[0] < 1:
                     continue
@@ -624,16 +677,15 @@ class PiAttentionContext:
                 if m.shape[1] < img1:
                     continue
 
-                q_avg = m[:q1].mean(0)  # (k,)
+                q_avg = m[q_start:q_end].mean(0)  # (k,)
                 img_slice = q_avg[img0:img1]
 
                 img_mass, ent_norm, score = self._entropy_score(img_slice)
-                layer_mass = float(img_mass)
                 layer_score = float(score if use_entropy_score else img_mass)
 
                 if layer_score > best_score:
                     best_score = layer_score
-                    best_mass = layer_mass
+                    best_mass = float(img_mass)
                     best_layer = int(li)
 
             if best_layer is None:
@@ -645,23 +697,24 @@ class PiAttentionContext:
                 self._suppressed += 1
                 return out
 
-            # chosen の “代表スコア” を計算して, chunk生成中のベストだけ残す
             m_chosen = chosen[0].to(dtype=torch.float32).mean(0)  # (q, k)
-            q_avg_chosen = m_chosen[:q1].mean(0)
+            q_avg_chosen = m_chosen[q_start:q_end].mean(0)
             img_slice_chosen = q_avg_chosen[img0:img1]
             img_mass_c, ent_norm_c, score_c = self._entropy_score(img_slice_chosen)
-            rep_mass = float(img_mass_c)
             rep_score = float(score_c if use_entropy_score else img_mass_c)
 
-            # “より良い” と判断したときだけ更新する (chunk中の中途半端な snapshot で上書きしない)
             if rep_score >= (self._best_score_in_group + 1e-12):
                 self._best_score_in_group = rep_score
 
                 model.last_attn_suffix = chosen.detach()
                 model._attn_suffix_best_layer = int(best_layer)
-                model._attn_suffix_best_mass = float(rep_mass)
+                model._attn_suffix_best_mass = float(img_mass_c)
                 model._attn_suffix_best_score = float(rep_score)
+
+                # collect側で「state tokenを避ける」ために保持する
                 model._attn_suffix_q1 = int(q1)
+                model._attn_suffix_q_start = int(q_start)
+                model._attn_suffix_q_end = int(q_end)
 
                 if self._pending_new_version:
                     model._attn_suffix_version = int(getattr(model, "_attn_suffix_version", 0)) + 1
@@ -669,16 +722,17 @@ class PiAttentionContext:
 
                 if _attn_debug_enabled():
                     logging.info(
-                        "[attn][%s] chunk_update version=%d best_layer=%d mass=%.6f score=%.6f entropy_norm=%.3f q_len=%d k_len=%d q1=%d",
+                        "[attn][%s] chunk_update version=%d best_layer=%d img_mass=%.6f score=%.6f entropy_norm=%.3f q_len=%d k_len=%d q_range=[%d,%d)",
                         policy_name,
                         int(model._attn_suffix_version),
                         int(best_layer),
-                        float(rep_mass),
+                        float(img_mass_c),
                         float(rep_score),
                         float(ent_norm_c),
                         q_len,
                         k_len,
-                        int(q1),
+                        int(q_start),
+                        int(q_end),
                     )
 
             return out
@@ -735,23 +789,19 @@ class PiAttentionContext:
         policy_name = getattr(policy, "name", "pi")
         is_pi0 = policy_name == "pi0"
 
-        # π0: アクション列(先頭q1)で平均した “集約ヒートマップ”
-        # π0.5: 従来どおりステップごとの query 行
-        if is_pi0:
-            q1 = int(getattr(model, "_attn_suffix_q1", 0) or 0)
-            if q1 <= 0:
-                rtc = getattr(policy.config, "rtc_config", None)
-                exec_h = int(getattr(rtc, "execution_horizon", 0) or 0) if rtc is not None else 0
-                if exec_h <= 0:
-                    exec_h = 10
-                q1 = min(q_len, max(1, exec_h))
-            q1 = max(1, min(q_len, q1))
-            q_row = attn_mean[:q1].mean(0)  # (k,)
-            q_dbg = (0, q1)
-        else:
-            q_idx = int(max(0, min(self._step, q_len - 1)))
-            q_row = attn_mean[q_idx]  # (k,)
-            q_dbg = (q_idx, q_idx + 1)
+        # π0はq=0がstate tokenなのでスキップする
+        q_offset_default = 1 if is_pi0 else 0
+        q_offset = int(getattr(model, "_attn_suffix_q_start", q_offset_default) or q_offset_default)
+        if q_offset >= q_len:
+            return []
+
+        n_action_steps = int(getattr(policy.config, "n_action_steps", 1) or 1)
+        max_steps = max(1, min(n_action_steps, q_len - q_offset))
+
+        q_idx = int(q_offset + max(0, min(self._step, max_steps - 1)))
+        q_row = attn_mean[q_idx]  # (k,)
+        q_dbg = (q_idx, q_idx + 1)
+        mode_str = "per_step_skip_state" if is_pi0 else "per_step"
 
         samples: list[AttentionSample] = []
         for img_range, cam_key in zip(ranges, names, strict=False):
@@ -809,7 +859,7 @@ class PiAttentionContext:
                     int(self._suppressed),
                     int(argmax[0]),
                     int(argmax[1]),
-                    "mean_q" if is_pi0 else "per_step",
+                    mode_str
                 )
 
             samples.append(
@@ -826,10 +876,8 @@ class PiAttentionContext:
                 )
             )
 
-        # π0.5 のみ step を進める (π0 は mean_q なので固定)
-        if not is_pi0:
-            n_action_steps = int(getattr(policy.config, "n_action_steps", 1) or 1)
-            if n_action_steps > 1:
-                self._step = min(self._step + 1, n_action_steps - 1)
+        # π0もπ0.5も per-step 表示にする
+        if max_steps > 1:
+            self._step = min(self._step + 1, max_steps - 1)
 
         return samples

@@ -54,6 +54,17 @@ def _clip01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
 
+def _rot180(img: np.ndarray) -> np.ndarray:
+    """Rotate image 180 degrees."""
+    return np.ascontiguousarray(np.rot90(img, 2))
+
+
+def _to_gray3(rgb: np.ndarray) -> np.ndarray:
+    """Convert RGB to grayscale, replicated to 3 channels."""
+    gray = (rgb[..., 0] * 0.299 + rgb[..., 1] * 0.587 + rgb[..., 2] * 0.114).astype(np.uint8)
+    return np.repeat(gray[..., None], 3, axis=2)
+
+
 def _quat_conj(q: np.ndarray) -> np.ndarray:
     """Quaternion conjugate."""
     return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float64)
@@ -122,6 +133,12 @@ class MuJoCoSim(Robot):
         # Cube positions
         self._cube_positions: list[dict] = []
         self._cube_pos_idx = 0
+        self._episode_count = 0  # Total episode counter for position cycling
+
+        # Place target (dish) IDs
+        self._place_target_body_id: int | None = None
+        self._place_target_site_id: int | None = None
+        self._place_target_geom_ids: list[int] = []  # All geom IDs of place target for contact detection
 
     @property
     def observation_features(self) -> dict:
@@ -200,6 +217,9 @@ class MuJoCoSim(Robot):
 
         # Setup grasp assist
         self._setup_grasp_assist()
+
+        # Setup place target IDs
+        self._setup_place_target()
 
         # Setup cameras
         self._setup_cameras()
@@ -315,6 +335,24 @@ class MuJoCoSim(Robot):
         if self._cube_geom_id is not None:
             self._cube_contype_orig = int(self.model.geom_contype[self._cube_geom_id])
             self._cube_conaff_orig = int(self.model.geom_conaffinity[self._cube_geom_id])
+
+    def _setup_place_target(self) -> None:
+        """Setup place target (dish) IDs for evaluation."""
+        def try_get_id(obj_type, name):
+            id_ = mujoco.mj_name2id(self.model, obj_type, name)
+            return int(id_) if id_ >= 0 else None
+
+        self._place_target_body_id = try_get_id(mujoco.mjtObj.mjOBJ_BODY, "place_target")
+        self._place_target_site_id = try_get_id(mujoco.mjtObj.mjOBJ_SITE, "place_target_site")
+
+        # Find all geom IDs belonging to place_target body for contact detection
+        self._place_target_geom_ids = []
+        if self._place_target_body_id is not None:
+            # Check all geoms to find those attached to place_target body
+            for gid in range(self.model.ngeom):
+                if int(self.model.geom_bodyid[gid]) == self._place_target_body_id:
+                    self._place_target_geom_ids.append(int(gid))
+            logger.info(f"Place target found with {len(self._place_target_geom_ids)} geoms: {self._place_target_geom_ids}")
 
     def _setup_cameras(self) -> None:
         """Setup camera rendering."""
@@ -552,6 +590,10 @@ class MuJoCoSim(Robot):
 
             rgb = self._render_camera(mjcf_cam_name)
             if rgb is not None:
+                # Apply camera2 preprocessing if enabled (to match training data)
+                if obs_key == "camera2" and self.config.camera2_preprocess:
+                    rgb = _rot180(rgb)
+                    rgb = _to_gray3(rgb)
                 obs[obs_key] = rgb
 
         # Add empty cameras (black images) if configured
@@ -585,8 +627,8 @@ class MuJoCoSim(Robot):
         action_vals = [action.get(f"{n}.pos", 0.0) for n in self.config.joint_names]
 
         if self._debug_frame_count <= 5:
-            logger.info(f"[send_action #{self._debug_frame_count}] Received action keys: {list(action.keys())}")
-            logger.info(f"[send_action #{self._debug_frame_count}] Normalized action values: {[f'{v:.2f}' for v in action_vals]}")
+            logger.debug(f"[send_action #{self._debug_frame_count}] Received action keys: {list(action.keys())}")
+            logger.debug(f"[send_action #{self._debug_frame_count}] Normalized action values: {[f'{v:.2f}' for v in action_vals]}")
 
         # Check if actions are in expected range
         for i, (name, val) in enumerate(zip(self.config.joint_names, action_vals)):
@@ -603,7 +645,7 @@ class MuJoCoSim(Robot):
         # Debug: Log denormalized action
         rad_vals = [rad_action.get(n, 0.0) for n in self.config.joint_names]
         if self._debug_frame_count <= 5:
-            logger.info(f"[send_action #{self._debug_frame_count}] Denormalized to radians: {[f'{v:.3f}' for v in rad_vals]}")
+            logger.debug(f"[send_action #{self._debug_frame_count}] Denormalized to radians: {[f'{v:.3f}' for v in rad_vals]}")
 
         # Apply to actuators
         for name, rad in rad_action.items():
@@ -645,22 +687,32 @@ class MuJoCoSim(Robot):
         self._connected = False
         logger.info(f"{self} disconnected.")
 
-    def reset_cube_position(self, index: int | None = None) -> None:
+    def reset_cube_position(self, index: int | None = None, reset_arm: bool = False) -> None:
         """
-        Reset cube to a preset position.
+        Reset cube to a preset position, and optionally move the place target.
 
         Args:
-            index: Position index. If None, uses next position in sequence.
+            index: Position index. If None, calculates from episode count and trials_per_position.
+            reset_arm: If True, also reset arm to home position.
         """
+        # Reset arm to home position first if requested
+        if reset_arm:
+            self.reset_arm_to_home()
+
         if not self._cube_positions or self._cube_qpos_adr is None:
             return
 
         if index is None:
-            index = self._cube_pos_idx
-            self._cube_pos_idx = (self._cube_pos_idx + 1) % len(self._cube_positions)
+            # Calculate position index from episode count and trials_per_position
+            trials = max(1, self.config.trials_per_position)
+            index = (self._episode_count // trials) % len(self._cube_positions)
+            logger.info(f"Episode {self._episode_count}, trials_per_position={trials}, using position index {index}")
 
         if index >= len(self._cube_positions):
             return
+
+        # Track current position index for get_current_preset()
+        self._cube_pos_idx = index
 
         preset = self._cube_positions[index]
         if "pos" in preset:
@@ -674,6 +726,161 @@ class MuJoCoSim(Robot):
         if self._cube_dof_adr is not None:
             self.data.qvel[self._cube_dof_adr : self._cube_dof_adr + 6] = 0.0
 
+        # Also set place target position if specified in preset
+        if "target_pos" in preset:
+            self.set_place_target_position(preset["target_pos"])
+
         self._attached = False
         self._set_cube_collision(True)
         mujoco.mj_forward(self.model, self.data)
+
+    def reset_arm_to_home(self) -> None:
+        """
+        Reset robot arm to home position using keyframe.
+        Preserves cube and place target positions.
+        """
+        if self.model.nkey > 0:
+            # Save cube position before reset (keyframe resets everything)
+            cube_qpos = None
+            if self._cube_qpos_adr is not None:
+                cube_qpos = self.data.qpos[self._cube_qpos_adr : self._cube_qpos_adr + 7].copy()
+
+            # Save place target position
+            place_target_pos = None
+            if self._place_target_body_id is not None:
+                place_target_pos = self.model.body_pos[self._place_target_body_id].copy()
+
+            # Use mj_resetDataKeyframe for complete reset (includes qpos, qvel, ctrl, etc.)
+            mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
+
+            # Restore cube position
+            if cube_qpos is not None and self._cube_qpos_adr is not None:
+                self.data.qpos[self._cube_qpos_adr : self._cube_qpos_adr + 7] = cube_qpos
+                if self._cube_dof_adr is not None:
+                    self.data.qvel[self._cube_dof_adr : self._cube_dof_adr + 6] = 0.0
+
+            # Restore place target position
+            if place_target_pos is not None and self._place_target_body_id is not None:
+                self.model.body_pos[self._place_target_body_id] = place_target_pos
+
+            mujoco.mj_forward(self.model, self.data)
+
+            # Log the actual normalized values for debugging
+            state = self._normalize_state()
+            state_vals = [state.get(f"{n}.pos", 0.0) for n in self.config.joint_names]
+            logger.info(f"Reset arm to home position: {[f'{v:.2f}' for v in state_vals]}")
+
+    def prepare_next_episode(self) -> None:
+        """
+        Prepare for the next episode by resetting arm and cube position.
+        This should be called at the end of each episode before starting the next one.
+        """
+        self._episode_count += 1
+        self.reset_cube_position(index=None, reset_arm=True)
+        logger.info(f"Prepared for episode {self._episode_count}")
+
+    def get_cube_position(self) -> np.ndarray | None:
+        """
+        Get current cube position.
+
+        Returns:
+            Cube position as numpy array [x, y, z], or None if cube not found.
+        """
+        if self._cube_qpos_adr is None:
+            return None
+        return self.data.qpos[self._cube_qpos_adr : self._cube_qpos_adr + 3].copy()
+
+    def get_place_target_position(self) -> np.ndarray | None:
+        """
+        Get current place target (dish) position.
+
+        Returns:
+            Place target position as numpy array [x, y, z], or None if not found.
+        """
+        if self._place_target_body_id is None:
+            return None
+        return self.data.xpos[self._place_target_body_id].copy()
+
+    def set_place_target_position(self, pos: list | tuple | np.ndarray) -> None:
+        """
+        Set place target (dish) position.
+
+        Args:
+            pos: New position [x, y, z].
+        """
+        if self._place_target_body_id is None:
+            logger.warning("Place target body not found in scene")
+            return
+
+        pos_arr = np.array(pos, dtype=np.float64)
+        # Update body position via mocap or direct manipulation
+        # Note: For static bodies, we modify the body's com position
+        self.model.body_pos[self._place_target_body_id] = pos_arr
+        logger.info(f"Set place target position: {pos_arr.tolist()}")
+
+    def get_current_preset(self) -> dict | None:
+        """
+        Get the current position preset (cube pos, target pos, etc.).
+
+        Returns:
+            Current preset dict, or None if no presets loaded.
+        """
+        if not self._cube_positions:
+            return None
+        # Return the preset at current index
+        idx = min(self._cube_pos_idx, len(self._cube_positions) - 1)
+        return self._cube_positions[idx]
+
+    def get_distance_to_target(self) -> float | None:
+        """
+        Calculate horizontal distance from cube to place target.
+
+        Returns:
+            Distance in meters (XY plane only), or None if positions unavailable.
+        """
+        cube_pos = self.get_cube_position()
+        if cube_pos is None:
+            return None
+
+        # Prefer target_pos from current preset (this is the authoritative source)
+        target_pos = None
+        preset = self.get_current_preset()
+        if preset and "target_pos" in preset:
+            target_pos = np.array(preset["target_pos"], dtype=np.float64)
+
+        # Fallback to place_target body position if no preset
+        if target_pos is None:
+            target_pos = self.get_place_target_position()
+
+        if target_pos is None:
+            return None
+
+        # XY distance only (ignore Z)
+        return float(np.linalg.norm(cube_pos[:2] - target_pos[:2]))
+
+    def is_cube_on_target(self) -> bool | None:
+        """
+        Check if cube is in contact with place target (dish).
+
+        Uses MuJoCo contact detection to determine if the cube geom
+        is touching any of the place target geoms.
+
+        Returns:
+            True if cube is touching place target, False if not, None if detection unavailable.
+        """
+        if self._cube_geom_id is None or not self._place_target_geom_ids:
+            return None
+
+        # Check all active contacts
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            geom1 = int(contact.geom1)
+            geom2 = int(contact.geom2)
+
+            # Check if this contact involves cube and any place target geom
+            if geom1 == self._cube_geom_id and geom2 in self._place_target_geom_ids:
+                return True
+            if geom2 == self._cube_geom_id and geom1 in self._place_target_geom_ids:
+                return True
+
+        return False

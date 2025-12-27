@@ -180,11 +180,25 @@ def build_joint_config_from_action(
     action: Dict[str, Any],
     urdf_joint_names: List[str],
 ) -> Dict[str, float]:
+    """
+    支援するフォーマット:
+      - dict: {"shoulder_pan.pos": deg, ...}
+      - list/tuple: [deg0, deg1, ...] （ACTION_KEYS の順で並んでいる想定）
+    """
     if len(ACTION_KEYS) > len(urdf_joint_names):
         raise ValueError(
             f"Number of ACTION_KEYS ({len(ACTION_KEYS)}) is greater than number of URDF joints "
             f"({len(urdf_joint_names)}). Cannot build joint config."
         )
+
+    if isinstance(action, (list, tuple)):
+        if len(action) < len(ACTION_KEYS):
+            raise ValueError(
+                f"Action list length {len(action)} is smaller than required keys {len(ACTION_KEYS)}"
+            )
+        action = {k: action[i] for i, k in enumerate(ACTION_KEYS)}
+    elif not isinstance(action, dict):
+        raise ValueError(f"Action must be dict or list, got {type(action)}")
 
     # "shoulder_pan.pos" -> "shoulder_pan"
     base_vals_deg: Dict[str, float] = {}
@@ -257,15 +271,24 @@ def compute_fk_plans(
             continue
 
         plan_points: List[np.ndarray] = []
+
         for action in actions:
-            if not isinstance(action, dict):
-                raise ValueError(f"Action must be a dict, got {type(action)}")
-            joint_cfg = build_joint_config_from_action(action, urdf_joint_names)
-            fk_all = robot.link_fk(joint_cfg)
-            T = fk_all[ee_link]
-            pos = np.asarray(T[:3, 3], dtype=float)
-            plan_points.append(pos)
-            total_actions += 1
+            # action は以下どれか:
+            #  - dict                -> 1 ステップ
+            #  - list/tuple of scalars -> 1 ステップ (ACTION_KEYS 順)
+            #  - list/tuple of list   -> 複数ステップ (各要素が上記1ステップ)
+            if isinstance(action, (list, tuple)) and action and isinstance(action[0], (list, tuple, dict)):
+                seq = action  # 多段リストを展開
+            else:
+                seq = [action]
+
+            for step in seq:
+                joint_cfg = build_joint_config_from_action(step, urdf_joint_names)
+                fk_all = robot.link_fk(joint_cfg)
+                T = fk_all[ee_link]
+                pos = np.asarray(T[:3, 3], dtype=float)
+                plan_points.append(pos)
+                total_actions += 1
 
         chunk_starts.append(base_idx)
         plans_3d.append(plan_points)

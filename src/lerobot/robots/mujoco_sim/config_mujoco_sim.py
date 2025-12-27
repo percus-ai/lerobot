@@ -52,6 +52,10 @@ class MuJoCoSimConfig(RobotConfig):
     # Cube position preset (JSON file with pos/quat arrays)
     cube_positions: str | None = None
 
+    # Number of trials (episodes) per position before moving to next position
+    # Used for automated evaluation: each position is evaluated this many times
+    trials_per_position: int = 1
+
     # Viewer settings
     show_viewer: bool = True
     cam_distance: float = 0.95
@@ -93,3 +97,7 @@ class MuJoCoSimConfig(RobotConfig):
     # Number of empty cameras (for policies trained with empty_camera placeholders)
     # Set to 0 to match real robot behavior (policy handles empty cameras internally)
     num_empty_cameras: int = 0
+
+    # Camera2 preprocessing (to match training data preprocessing)
+    # When True, applies 180° rotation and grayscale->3ch conversion to camera2
+    camera2_preprocess: bool = True
