@@ -518,6 +518,8 @@ def record_loop(
 
     timestamp = 0
     frame_idx = 0
+    contact_start_t = None  # Track when cube first touched target
+    success_hold_duration = 1.0  # Seconds of sustained contact required for success
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
@@ -584,6 +586,21 @@ def record_loop(
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         _sent_action = robot.send_action(robot_action_to_send)
+
+        # Check for task success (MuJoCoSim: cube on target for sustained duration)
+        if policy is not None and hasattr(robot, "is_cube_on_target"):
+            is_on_target = robot.is_cube_on_target()
+            if is_on_target is True:
+                if contact_start_t is None:
+                    contact_start_t = time.perf_counter()
+                    logging.info(f"Contact started at frame {frame_idx}")
+                elif time.perf_counter() - contact_start_t >= success_hold_duration:
+                    logging.info(f"Task success: contact held for {success_hold_duration}s, ending episode at frame {frame_idx}")
+                    events["exit_early"] = True
+            else:
+                if contact_start_t is not None:
+                    logging.info(f"Contact lost at frame {frame_idx}, resetting timer")
+                contact_start_t = None
 
         # Write to dataset
         if dataset is not None:
@@ -715,6 +732,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     listener, events = init_keyboard_listener()
 
+    # For MuJoCo sim: ensure arm is at home position before first episode
+    # This makes episode 0 consistent with subsequent episodes (which use prepare_next_episode)
+    if hasattr(robot, "reset_arm_to_home"):
+        robot.reset_arm_to_home()
+
     with VideoEncodingManager(dataset):
         recorded_episodes = 0
         while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
@@ -746,6 +768,16 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             if simple_recorder is not None:
                 simple_recorder.finish_episode()
 
+            # Evaluate success/failure for MuJoCo simulation BEFORE reset
+            # (cube position changes after prepare_next_episode)
+            # Success = cube is in contact with place target (dish)
+            episode_distance = None
+            episode_success = None
+            if hasattr(robot, "is_cube_on_target"):
+                episode_success = robot.is_cube_on_target()
+            if hasattr(robot, "get_distance_to_target"):
+                episode_distance = robot.get_distance_to_target()
+
             # Execute a few seconds without recording to give time to manually reset the environment
             # Skip reset for the last episode to be recorded
             if not events["stop_recording"] and (
@@ -760,12 +792,20 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     robot_action_processor=robot_action_processor,
                     robot_observation_processor=robot_observation_processor,
                     teleop=teleop,
+                    policy=policy,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    dataset=dataset,
                     control_time_s=cfg.dataset.reset_time_s,
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
                     attn_recorder=None,
                     simple_recorder=None,
                 )
+                # For MuJoCo sim: reset arm to home and set next cube position AFTER reset loop
+                # This ensures the arm is at home position when the next episode starts recording
+                if hasattr(robot, "prepare_next_episode"):
+                    robot.prepare_next_episode()
 
             if events["rerecord_episode"]:
                 log_say("Re-record episode", cfg.play_sounds)
@@ -776,6 +816,20 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
             parallel_encoding = sys.platform != "darwin"
             dataset.save_episode(parallel_encoding=parallel_encoding)
+
+            # Log the evaluation result (contact was checked before reset)
+            if episode_success is not None:
+                result_str = "SUCCESS (contact)" if episode_success else "FAILURE (no contact)"
+                ep_idx = dataset.num_episodes - 1
+                dist_str = f", distance: {episode_distance:.4f}m" if episode_distance is not None else ""
+                print(f"[EVAL] Episode {ep_idx}: {result_str}{dist_str}")
+
+                # Write to incremental log file
+                log_path = Path(cfg.dataset.root) / "eval_results.txt" if cfg.dataset.root else Path("eval_results.txt")
+                with open(log_path, "a") as f:
+                    dist_str_log = f", distance={episode_distance:.4f}m" if episode_distance is not None else ""
+                    f.write(f"Episode {ep_idx}: {result_str}{dist_str_log}\n")
+
             # ポリシー実行時に計画軌跡オーバーレイを自動生成（任意）
             if cfg.policy is not None and cfg.dataset.generate_plan_overlay:
                 dataset_root = Path(cfg.dataset.root) if cfg.dataset.root is not None else Path(dataset.root)
@@ -795,6 +849,26 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             recorded_episodes += 1
 
     log_say("Stop recording", cfg.play_sounds, blocking=True)
+
+    # Write evaluation summary if log file exists
+    log_path = Path(cfg.dataset.root) / "eval_results.txt" if cfg.dataset.root else Path("eval_results.txt")
+    if log_path.exists():
+        # Count successes and failures
+        successes = 0
+        total = 0
+        with open(log_path, "r") as f:
+            for line in f:
+                if "SUCCESS" in line:
+                    successes += 1
+                    total += 1
+                elif "FAILURE" in line:
+                    total += 1
+        if total > 0:
+            rate = successes / total * 100
+            summary = f"\n{'='*50}\nEvaluation Summary: {successes}/{total} ({rate:.1f}%)\n{'='*50}\n"
+            print(summary)
+            with open(log_path, "a") as f:
+                f.write(summary)
 
     robot.disconnect()
     if teleop is not None:
