@@ -63,6 +63,7 @@ import logging
 import sys
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from pprint import pformat
 from typing import Any
@@ -736,6 +737,19 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     # This makes episode 0 consistent with subsequent episodes (which use prepare_next_episode)
     if hasattr(robot, "reset_arm_to_home"):
         robot.reset_arm_to_home()
+
+    # Write eval_results.txt header when running with a policy
+    if cfg.policy is not None:
+        log_path = Path(cfg.dataset.root) / "eval_results.txt" if cfg.dataset.root else Path("eval_results.txt")
+        with open(log_path, "w") as f:
+            f.write(f"Policy: {cfg.policy.pretrained_path}\n")
+            f.write(f"Task: {cfg.dataset.single_task}\n")
+            # Get cube_positions from robot config if available
+            cube_positions_path = getattr(cfg.robot, 'cube_positions', None)
+            if cube_positions_path:
+                f.write(f"Positions: {cube_positions_path}\n")
+            f.write(f"Timestamp: {datetime.now().isoformat()}\n")
+            f.write(f"{'='*50}\n")
 
     with VideoEncodingManager(dataset):
         recorded_episodes = 0
