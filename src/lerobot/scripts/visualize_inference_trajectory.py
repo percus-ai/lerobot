@@ -23,6 +23,7 @@ except ImportError:
 
 
 # ログに出てくる SO-101 の関節キー（LeRobot の action dict）
+# 単腕用
 ACTION_KEYS = [
     "shoulder_pan.pos",
     "shoulder_lift.pos",
@@ -31,6 +32,33 @@ ACTION_KEYS = [
     "wrist_roll.pos",
     "gripper.pos",
 ]
+
+# 双腕用（左）
+ACTION_KEYS_LEFT = [f"left_{k}" for k in ACTION_KEYS]
+# 双腕用（右）
+ACTION_KEYS_RIGHT = [f"right_{k}" for k in ACTION_KEYS]
+
+
+def detect_arm_mode(action: Dict[str, Any] | List | Tuple) -> str:
+    """
+    アクションデータから単腕/双腕モードを検出する。
+    Returns: "single", "bimanual", or "unknown"
+    """
+    if isinstance(action, dict):
+        keys = set(action.keys())
+        has_left = any(k.startswith("left_") for k in keys)
+        has_right = any(k.startswith("right_") for k in keys)
+        if has_left and has_right:
+            return "bimanual"
+        elif not has_left and not has_right:
+            return "single"
+    elif isinstance(action, (list, tuple)):
+        # リスト形式の場合、長さで判断
+        if len(action) == len(ACTION_KEYS):
+            return "single"
+        elif len(action) == len(ACTION_KEYS) * 2:
+            return "bimanual"
+    return "unknown"
 
 
 def parse_args() -> argparse.Namespace:
@@ -179,33 +207,47 @@ def open_video(attn_dir: Path, episode: int, repo_id: str | None) -> cv2.VideoCa
 def build_joint_config_from_action(
     action: Dict[str, Any],
     urdf_joint_names: List[str],
+    action_keys: List[str] | None = None,
 ) -> Dict[str, float]:
     """
     支援するフォーマット:
-      - dict: {"shoulder_pan.pos": deg, ...}
-      - list/tuple: [deg0, deg1, ...] （ACTION_KEYS の順で並んでいる想定）
+      - dict: {"shoulder_pan.pos": deg, ...} or {"left_shoulder_pan.pos": deg, ...}
+      - list/tuple: [deg0, deg1, ...] （action_keys の順で並んでいる想定）
+
+    action_keys: 使用するキーのリスト。Noneの場合はACTION_KEYSを使用。
+                 双腕の場合はACTION_KEYS_LEFT or ACTION_KEYS_RIGHTを指定。
     """
-    if len(ACTION_KEYS) > len(urdf_joint_names):
+    if action_keys is None:
+        action_keys = ACTION_KEYS
+
+    if len(action_keys) > len(urdf_joint_names):
         raise ValueError(
-            f"Number of ACTION_KEYS ({len(ACTION_KEYS)}) is greater than number of URDF joints "
+            f"Number of action_keys ({len(action_keys)}) is greater than number of URDF joints "
             f"({len(urdf_joint_names)}). Cannot build joint config."
         )
 
     if isinstance(action, (list, tuple)):
-        if len(action) < len(ACTION_KEYS):
+        if len(action) < len(action_keys):
             raise ValueError(
-                f"Action list length {len(action)} is smaller than required keys {len(ACTION_KEYS)}"
+                f"Action list length {len(action)} is smaller than required keys {len(action_keys)}"
             )
-        action = {k: action[i] for i, k in enumerate(ACTION_KEYS)}
+        action = {k: action[i] for i, k in enumerate(action_keys)}
     elif not isinstance(action, dict):
         raise ValueError(f"Action must be dict or list, got {type(action)}")
 
     # "shoulder_pan.pos" -> "shoulder_pan"
+    # "left_shoulder_pan.pos" -> "shoulder_pan" (プレフィックスを除去)
     base_vals_deg: Dict[str, float] = {}
-    for key in ACTION_KEYS:
+    for key in action_keys:
         if key not in action:
             raise KeyError(f"Action key '{key}' not found in action dict: {list(action.keys())}")
-        base_name = key.split(".")[0]
+        # プレフィックスを除去してベース名を取得
+        base_key = key
+        if base_key.startswith("left_"):
+            base_key = base_key[5:]  # "left_" を除去
+        elif base_key.startswith("right_"):
+            base_key = base_key[6:]  # "right_" を除去
+        base_name = base_key.split(".")[0]
         base_vals_deg[base_name] = float(action[key])
 
     joint_cfg: Dict[str, float] = {}
@@ -215,16 +257,17 @@ def build_joint_config_from_action(
         joint_cfg[joint_name] = float(np.deg2rad(base_vals_deg[joint_name]))
     return joint_cfg
 
-
 def compute_fk_plans(
     urdf_path: Path,
     ee_link_name: str,
     frames: List[Dict[str, Any]],
-) -> Tuple[List[int], List[List[np.ndarray]]]:
+) -> Tuple[List[int], List[List[np.ndarray]], List[List[np.ndarray]] | None, str]:
     """
     episode_values_*.json の frames から、
       - chunk_starts: 各 chunk の frame_idx のリスト
-      - plans_3d: 各 chunk ごとの「未来軌跡」の 3D 位置リスト (actions の長さ分)
+      - plans_3d: 各 chunk ごとの「未来軌跡」の 3D 位置リスト (単腕 or 左腕)
+      - plans_3d_right: 双腕の場合の右腕軌跡、単腕の場合はNone
+      - arm_mode: "single" or "bimanual"
     を返す。
 
     ここで actions は「n_action_steps step horizon の joint 指令列」とみなす。
@@ -259,8 +302,22 @@ def compute_fk_plans(
     # 念のため frame_idx でソート
     records = sorted(frames, key=lambda r: int(r["frame_idx"]))
 
+    # 最初のアクションからアームモードを検出
+    arm_mode = "single"
+    for rec in records:
+        actions = rec.get("actions", [])
+        if actions:
+            first_action = actions[0]
+            if isinstance(first_action, (list, tuple)) and first_action and isinstance(first_action[0], (list, tuple, dict)):
+                first_action = first_action[0]
+            arm_mode = detect_arm_mode(first_action)
+            break
+
+    print(f"[STEP 3] Detected arm mode: {arm_mode}")
+
     chunk_starts: List[int] = []
-    plans_3d: List[List[np.ndarray]] = []
+    plans_3d: List[List[np.ndarray]] = []  # 単腕 or 左腕
+    plans_3d_right: List[List[np.ndarray]] | None = [] if arm_mode == "bimanual" else None
 
     total_actions = 0
 
@@ -271,46 +328,80 @@ def compute_fk_plans(
             continue
 
         plan_points: List[np.ndarray] = []
+        plan_points_right: List[np.ndarray] = []
 
         for action in actions:
             # action は以下どれか:
-            #  - dict                -> 1 ステップ
+            #  - dict                  -> 1 ステップ
             #  - list/tuple of scalars -> 1 ステップ (ACTION_KEYS 順)
-            #  - list/tuple of list   -> 複数ステップ (各要素が上記1ステップ)
+            #  - list/tuple of list    -> 複数ステップ (各要素が上記1ステップ)
             if isinstance(action, (list, tuple)) and action and isinstance(action[0], (list, tuple, dict)):
                 seq = action  # 多段リストを展開
             else:
                 seq = [action]
 
             for step in seq:
-                joint_cfg = build_joint_config_from_action(step, urdf_joint_names)
-                fk_all = robot.link_fk(joint_cfg)
-                T = fk_all[ee_link]
-                pos = np.asarray(T[:3, 3], dtype=float)
-                plan_points.append(pos)
+                if arm_mode == "bimanual":
+                    # 左腕
+                    try:
+                        joint_cfg_left = build_joint_config_from_action(step, urdf_joint_names, ACTION_KEYS_LEFT)
+                        fk_all_left = robot.link_fk(joint_cfg_left)
+                        T_left = fk_all_left[ee_link]
+                        pos_left = np.asarray(T_left[:3, 3], dtype=float)
+                        plan_points.append(pos_left)
+                    except (KeyError, ValueError) as e:
+                        print(f"[STEP 3] Warning: Left arm FK failed: {e}")
+
+                    # 右腕
+                    try:
+                        joint_cfg_right = build_joint_config_from_action(step, urdf_joint_names, ACTION_KEYS_RIGHT)
+                        fk_all_right = robot.link_fk(joint_cfg_right)
+                        T_right = fk_all_right[ee_link]
+                        pos_right = np.asarray(T_right[:3, 3], dtype=float)
+                        plan_points_right.append(pos_right)
+                    except (KeyError, ValueError) as e:
+                        print(f"[STEP 3] Warning: Right arm FK failed: {e}")
+                else:
+                    # 単腕
+                    joint_cfg = build_joint_config_from_action(step, urdf_joint_names, ACTION_KEYS)
+                    fk_all = robot.link_fk(joint_cfg)
+                    T = fk_all[ee_link]
+                    pos = np.asarray(T[:3, 3], dtype=float)
+                    plan_points.append(pos)
+
                 total_actions += 1
 
         chunk_starts.append(base_idx)
         plans_3d.append(plan_points)
+        if plans_3d_right is not None:
+            plans_3d_right.append(plan_points_right)
 
     print(
         f"[STEP 3] OK: computed plans for {len(chunk_starts)} chunks "
-        f"(total actions processed={total_actions})."
+        f"(total actions processed={total_actions}, arm_mode={arm_mode})."
     )
-    if chunk_starts:
-        print("[STEP 3] Sample plan (first chunk, first 5 points):")
+    if chunk_starts and plans_3d[0]:
+        print("[STEP 3] Sample plan (first chunk, first 5 points - left/single arm):")
         for i, pos in enumerate(plans_3d[0][:5]):
             print(f"  step {i}: EE pos = [{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
+        if plans_3d_right and plans_3d_right[0]:
+            print("[STEP 3] Sample plan (first chunk, first 5 points - right arm):")
+            for i, pos in enumerate(plans_3d_right[0][:5]):
+                print(f"  step {i}: EE pos = [{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
 
-    return chunk_starts, plans_3d
-
+    return chunk_starts, plans_3d, plans_3d_right, arm_mode
 
 # ====== STEP 4: fk_image.conf の読み込み ======
 
-def load_fk_image_conf(attn_dir: Path | None = None) -> np.ndarray:
+def load_fk_image_conf(attn_dir: Path | None = None) -> Tuple[np.ndarray, np.ndarray | None, str]:
     """
     scripts/SO101/fk_image.conf から affine_matrix を読む。
-    attn_dir 引数は後方互換のために受け取るだけで、探索は SO101 固定。
+    双腕対応: affine_matrix_left, affine_matrix_right を読み込む。
+
+    Returns:
+        affine: 単腕または左腕用のaffine行列
+        affine_right: 右腕用のaffine行列（双腕の場合）、単腕の場合はNone
+        config_arm_mode: 設定ファイル内のarm_mode ("single" or "bimanual")
     """
     script_dir = Path(__file__).resolve().parent
     conf_path = script_dir / "SO101" / "fk_image.conf"
@@ -326,18 +417,42 @@ def load_fk_image_conf(attn_dir: Path | None = None) -> np.ndarray:
     with conf_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    if "affine_matrix" not in data:
-        raise ValueError("fk_image.conf must contain key 'affine_matrix'.")
+    config_arm_mode = data.get("arm_mode", "single")
 
-    A = np.asarray(data["affine_matrix"], dtype=float)
-    if A.shape != (2, 3):
-        raise ValueError(
-            f"fk_image.conf['affine_matrix'] must be shape (2, 3), got {A.shape} instead."
-        )
+    if config_arm_mode == "bimanual":
+        # 双腕モード
+        if "affine_matrix_left" not in data or "affine_matrix_right" not in data:
+            raise ValueError(
+                "fk_image.conf is in bimanual mode but missing 'affine_matrix_left' or 'affine_matrix_right'."
+            )
 
-    print("[STEP 4] OK: loaded affine_matrix from fk_image.conf:")
-    print(A)
-    return A
+        A_left = np.asarray(data["affine_matrix_left"], dtype=float)
+        A_right = np.asarray(data["affine_matrix_right"], dtype=float)
+
+        if A_left.shape != (2, 3):
+            raise ValueError(f"affine_matrix_left must be shape (2, 3), got {A_left.shape}.")
+        if A_right.shape != (2, 3):
+            raise ValueError(f"affine_matrix_right must be shape (2, 3), got {A_right.shape}.")
+
+        print("[STEP 4] OK: loaded bimanual affine matrices from fk_image.conf:")
+        print(f"  LEFT:\n{A_left}")
+        print(f"  RIGHT:\n{A_right}")
+        return A_left, A_right, config_arm_mode
+
+    else:
+        # 単腕モード（後方互換）
+        if "affine_matrix" not in data:
+            raise ValueError("fk_image.conf must contain key 'affine_matrix'.")
+
+        A = np.asarray(data["affine_matrix"], dtype=float)
+        if A.shape != (2, 3):
+            raise ValueError(
+                f"fk_image.conf['affine_matrix'] must be shape (2, 3), got {A.shape} instead."
+            )
+
+        print("[STEP 4] OK: loaded affine_matrix from fk_image.conf:")
+        print(A)
+        return A, None, config_arm_mode
 
 def project_world_to_image(affine: np.ndarray, pos_3d: np.ndarray) -> tuple[int, int]:
     x, y = float(pos_3d[0]), float(pos_3d[1])
@@ -355,6 +470,9 @@ def overlay_plan_trajectory_video(
     plans_3d: List[List[np.ndarray]],
     affine: np.ndarray,
     output_path: Path,
+    plans_3d_right: List[List[np.ndarray]] | None = None,
+    arm_mode: str = "single",
+    affine_right: np.ndarray | None = None,
 ) -> None:
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -372,21 +490,46 @@ def overlay_plan_trajectory_video(
         raise RuntimeError(f"Failed to open VideoWriter for: {output_path}")
 
     print(f"[STEP 5] Writing overlay video to: {output_path}")
-    print(f"[STEP 5]  frames={frame_count}, fps={fps:.2f}, size={width}x{height}")
+    print(f"[STEP 5]  frames={frame_count}, fps={fps:.2f}, size={width}x{height}, arm_mode={arm_mode}")
 
-    # あらかじめ各 plan の 2D 投影を計算しておく
+    # あらかじめ各 plan の 2D 投影を計算しておく（左腕/単腕）
     plans_uv: List[List[Tuple[int, int]]] = []
     for plan in plans_3d:
         uv_list = [project_world_to_image(affine, p) for p in plan]
         plans_uv.append(uv_list)
 
-    # 各チャンクの計画軌跡をオーバーレイ画像として事前生成（赤線）
+    # 右腕の2D投影（双腕の場合のみ）- 右腕用affine行列を使用
+    plans_uv_right: List[List[Tuple[int, int]]] | None = None
+    if plans_3d_right is not None:
+        plans_uv_right = []
+        # 右腕用のaffine行列がなければ左腕用を使う（後方互換）
+        affine_for_right = affine_right if affine_right is not None else affine
+        for plan in plans_3d_right:
+            uv_list = [project_world_to_image(affine_for_right, p) for p in plan]
+            plans_uv_right.append(uv_list)
+
+    # 色の定義: 左腕=青, 右腕=赤, 単腕=赤
+    COLOR_LEFT = (255, 0, 0)    # BGR: 青
+    COLOR_RIGHT = (0, 0, 255)   # BGR: 赤
+    COLOR_SINGLE = (0, 0, 255)  # BGR: 赤
+    MARKER_LEFT = (0, 255, 255)   # BGR: 黄色（左腕現在位置）
+    MARKER_RIGHT = (0, 255, 0)    # BGR: 緑（右腕現在位置）
+    MARKER_SINGLE = (0, 255, 0)   # BGR: 緑（単腕現在位置）
+
+    # 各チャンクの計画軌跡をオーバーレイ画像として事前生成
     plan_overlays: List[np.ndarray] = []
-    for plan_uv in plans_uv:
+    for idx, plan_uv in enumerate(plans_uv):
         overlay = np.zeros((height, width, 3), dtype=np.float32)
+        color = COLOR_LEFT if arm_mode == "bimanual" else COLOR_SINGLE
         if len(plan_uv) >= 2:
             for i in range(1, len(plan_uv)):
-                cv2.line(overlay, plan_uv[i - 1], plan_uv[i], (0, 0, 255), 2)
+                cv2.line(overlay, plan_uv[i - 1], plan_uv[i], color, 2)
+        # 右腕の軌跡も追加（双腕の場合）
+        if plans_uv_right is not None and idx < len(plans_uv_right):
+            plan_uv_r = plans_uv_right[idx]
+            if len(plan_uv_r) >= 2:
+                for i in range(1, len(plan_uv_r)):
+                    cv2.line(overlay, plan_uv_r[i - 1], plan_uv_r[i], COLOR_RIGHT, 2)
         plan_overlays.append(overlay)
 
     # chunk_starts は昇順前提
@@ -433,7 +576,9 @@ def overlay_plan_trajectory_video(
             continue
 
         plan_uv = plans_uv[current_chunk_idx]
-        if len(plan_uv) < 2:
+        plan_uv_r = plans_uv_right[current_chunk_idx] if plans_uv_right is not None else None
+
+        if len(plan_uv) < 2 and (plan_uv_r is None or len(plan_uv_r) < 2):
             writer.write(frame)
             continue
 
@@ -447,20 +592,31 @@ def overlay_plan_trajectory_video(
         frame = cv2.addWeighted(frame, 1.0, overlay_uint8, 1.0, 0.0)
 
         # 「今どこまで来ているか」を計画上で示す
-        # t0 = chunk_starts[current_chunk_idx]
-        # step_idx = clamp(frame_idx - t0, 0, len(plan_uv)-1)
         t0 = chunk_starts[current_chunk_idx]
         step_idx = frame_idx - t0
         if step_idx < 0:
             step_idx = 0
-        if step_idx >= len(plan_uv):
-            step_idx = len(plan_uv) - 1
 
-        u_cur, v_cur = plan_uv[step_idx]
-        cv2.circle(frame, (u_cur, v_cur), 5, (0, 255, 0), -1)
+        # 左腕/単腕の現在位置マーカー
+        if len(plan_uv) > 0:
+            step_idx_left = min(step_idx, len(plan_uv) - 1)
+            u_cur, v_cur = plan_uv[step_idx_left]
+            marker_color = MARKER_LEFT if arm_mode == "bimanual" else MARKER_SINGLE
+            cv2.circle(frame, (u_cur, v_cur), 5, marker_color, -1)
+
+        # 右腕の現在位置マーカー（双腕の場合）
+        if plan_uv_r is not None and len(plan_uv_r) > 0:
+            step_idx_right = min(step_idx, len(plan_uv_r) - 1)
+            u_cur_r, v_cur_r = plan_uv_r[step_idx_right]
+            cv2.circle(frame, (u_cur_r, v_cur_r), 5, MARKER_RIGHT, -1)
 
         # デバッグ用に現在の chunk / step 情報を表示
-        info = f"chunk {current_chunk_idx}  frame {frame_idx}  plan_step {step_idx}/{len(plan_uv)-1}"
+        max_steps = max(len(plan_uv) - 1, 0)
+        if plan_uv_r:
+            max_steps = max(max_steps, len(plan_uv_r) - 1)
+        info = f"chunk {current_chunk_idx}  frame {frame_idx}  plan_step {step_idx}/{max_steps}"
+        if arm_mode == "bimanual":
+            info += " [bimanual: blue=L, red=R]"
         cv2.putText(
             frame,
             info,
@@ -511,17 +667,17 @@ def main() -> None:
     # 2. 動画オープン
     cap = open_video(attn_dir, episode, repo_id)
 
-    # 3. 各 chunk の未来軌跡 (plan) を FK で計算
-    chunk_starts, plans_3d = compute_fk_plans(
+    # 3. 各 chunk の未来軌跡 (plan) を FK で計算（双腕対応）
+    chunk_starts, plans_3d, plans_3d_right, arm_mode = compute_fk_plans(
         urdf_path=urdf_path,
         ee_link_name=ee_link_name,
         frames=frames,
     )
 
-    # 4. キャリブレーション fk_image.conf 読み込み
-    affine = load_fk_image_conf(attn_dir)
+    # 4. キャリブレーション fk_image.conf 読み込み（双腕対応）
+    affine, affine_right, config_arm_mode = load_fk_image_conf(attn_dir)
 
-    # 5. 計画軌跡オーバーレイ動画の書き出し
+    # 5. 計画軌跡オーバーレイ動画の書き出し（双腕対応）
     output_path = attn_dir / f"{output_suffix}_episode_{episode}.mp4"
     overlay_plan_trajectory_video(
         cap=cap,
@@ -529,6 +685,9 @@ def main() -> None:
         plans_3d=plans_3d,
         affine=affine,
         output_path=output_path,
+        plans_3d_right=plans_3d_right,
+        arm_mode=arm_mode,
+        affine_right=affine_right,
     )
 
     print("=== visualize_inference_trajectory (plan horizon): done (step1-5 OK) ===")

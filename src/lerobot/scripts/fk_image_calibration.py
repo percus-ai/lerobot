@@ -32,6 +32,27 @@ ACTION_KEYS = [
     "gripper.pos",
 ]
 
+# 双腕用（左）
+ACTION_KEYS_LEFT = [f"left_{k}" for k in ACTION_KEYS]
+# 双腕用（右）
+ACTION_KEYS_RIGHT = [f"right_{k}" for k in ACTION_KEYS]
+
+
+def detect_arm_mode(action: Dict[str, Any]) -> str:
+    """
+    アクションデータから単腕/双腕モードを検出する。
+    Returns: "single", "bimanual", or "unknown"
+    """
+    if isinstance(action, dict):
+        keys = set(action.keys())
+        has_left = any(k.startswith("left_") for k in keys)
+        has_right = any(k.startswith("right_") for k in keys)
+        if has_left and has_right:
+            return "bimanual"
+        elif not has_left and not has_right:
+            return "single"
+    return "unknown"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -160,22 +181,35 @@ def open_video(attn_dir: Path, episode: int, repo_id: str | None) -> cv2.VideoCa
 def build_joint_config_from_action(
     action: Dict[str, Any],
     urdf_joint_names: List[str],
+    action_keys: List[str] | None = None,
 ) -> Dict[str, float]:
     """
     URDF の関節名と ACTION_KEYS の順番が異なる場合があるので、名前で対応付ける。
+    action_keys: 使用するキーのリスト。Noneの場合はACTION_KEYSを使用。
+                 双腕の場合はACTION_KEYS_LEFT or ACTION_KEYS_RIGHTを指定。
     """
-    if len(ACTION_KEYS) > len(urdf_joint_names):
+    if action_keys is None:
+        action_keys = ACTION_KEYS
+
+    if len(action_keys) > len(urdf_joint_names):
         raise ValueError(
-            f"Number of ACTION_KEYS ({len(ACTION_KEYS)}) is greater than number of URDF joints "
+            f"Number of action_keys ({len(action_keys)}) is greater than number of URDF joints "
             f"({len(urdf_joint_names)}). Cannot build joint config."
         )
 
     # "shoulder_pan.pos" -> "shoulder_pan"
+    # "left_shoulder_pan.pos" -> "shoulder_pan" (プレフィックスを除去)
     base_vals_deg: Dict[str, float] = {}
-    for key in ACTION_KEYS:
+    for key in action_keys:
         if key not in action:
             raise KeyError(f"Action key '{key}' not found in action dict: {list(action.keys())}")
-        base_name = key.split(".")[0]
+        # プレフィックスを除去してベース名を取得
+        base_key = key
+        if base_key.startswith("left_"):
+            base_key = base_key[5:]  # "left_" を除去
+        elif base_key.startswith("right_"):
+            base_key = base_key[6:]  # "right_" を除去
+        base_name = base_key.split(".")[0]
         base_vals_deg[base_name] = float(action[key])
 
     joint_cfg: Dict[str, float] = {}
@@ -191,7 +225,14 @@ def compute_fk_trajectory(
     urdf_path: Path,
     ee_link_name: str,
     frames: List[Dict[str, Any]],
-) -> Dict[int, np.ndarray]:
+) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray] | None, str]:
+    """
+    FK軌跡を計算する。双腕の場合は左右別々の軌跡を返す。
+    Returns:
+        frame_to_pos: 左腕/単腕の軌跡
+        frame_to_pos_right: 右腕の軌跡（双腕の場合）、単腕の場合はNone
+        arm_mode: "single" or "bimanual"
+    """
     print(f"[STEP 3] Loading URDF: {urdf_path}")
     if not urdf_path.exists():
         raise FileNotFoundError(f"URDF file not found: {urdf_path}")
@@ -219,7 +260,18 @@ def compute_fk_trajectory(
         )
     ee_link = robot.link_map[ee_link_name]
 
+    # アームモードを検出
+    arm_mode = "single"
+    for rec in frames:
+        actions = rec.get("actions", [])
+        if actions and isinstance(actions[0], dict):
+            arm_mode = detect_arm_mode(actions[0])
+            break
+
+    print(f"[STEP 3] Detected arm mode: {arm_mode}")
+
     frame_to_pos: Dict[int, np.ndarray] = {}
+    frame_to_pos_right: Dict[int, np.ndarray] | None = {} if arm_mode == "bimanual" else None
     num_actions = 0
 
     for rec in frames:
@@ -233,20 +285,42 @@ def compute_fk_trajectory(
                 raise ValueError(f"Action must be a dict, got {type(action)}")
             frame_idx = base_idx + local_idx
 
-            joint_cfg = build_joint_config_from_action(action, urdf_joint_names)
-            fk_all = robot.link_fk(joint_cfg)
-            T = fk_all[ee_link]
-            pos = np.asarray(T[:3, 3], dtype=float)
+            if arm_mode == "bimanual":
+                # 左腕
+                try:
+                    joint_cfg_left = build_joint_config_from_action(action, urdf_joint_names, ACTION_KEYS_LEFT)
+                    fk_all_left = robot.link_fk(joint_cfg_left)
+                    T_left = fk_all_left[ee_link]
+                    pos_left = np.asarray(T_left[:3, 3], dtype=float)
+                    frame_to_pos[frame_idx] = pos_left
+                except (KeyError, ValueError):
+                    pass
 
-            frame_to_pos[frame_idx] = pos
+                # 右腕
+                try:
+                    joint_cfg_right = build_joint_config_from_action(action, urdf_joint_names, ACTION_KEYS_RIGHT)
+                    fk_all_right = robot.link_fk(joint_cfg_right)
+                    T_right = fk_all_right[ee_link]
+                    pos_right = np.asarray(T_right[:3, 3], dtype=float)
+                    frame_to_pos_right[frame_idx] = pos_right
+                except (KeyError, ValueError):
+                    pass
+            else:
+                # 単腕
+                joint_cfg = build_joint_config_from_action(action, urdf_joint_names, ACTION_KEYS)
+                fk_all = robot.link_fk(joint_cfg)
+                T = fk_all[ee_link]
+                pos = np.asarray(T[:3, 3], dtype=float)
+                frame_to_pos[frame_idx] = pos
+
             num_actions += 1
 
     print(
         f"[STEP 3] OK: computed FK for {len(frame_to_pos)} control frames "
-        f"(total actions processed={num_actions})."
+        f"(total actions processed={num_actions}, arm_mode={arm_mode})."
     )
 
-    return frame_to_pos
+    return frame_to_pos, frame_to_pos_right, arm_mode
 
 
 # ====== キャリブレーション固有の処理 ======
@@ -280,42 +354,74 @@ def interactive_collect_points(
     cap: cv2.VideoCapture,
     frame_to_pos: Dict[int, np.ndarray],
     frame_step: int,
+    arm_label: str = "",
 ) -> Tuple[List[int], List[np.ndarray], List[Tuple[int, int]]]:
+    """
+    インタラクティブにキャリブレーション点を収集する。
+    arm_label: 表示用のラベル（"LEFT", "RIGHT", ""など）
+    
+    操作方法：
+    - 左クリック: その点を登録して自動的に次のフレームへ
+    - n: 何も登録せずに次のフレームへ
+    - b: 一つ前のフレームに戻る
+    - q: 終了（3点以上必要）
+    """
     frame_indices = sorted(frame_to_pos.keys())
     if not frame_indices:
         raise ValueError("frame_to_pos is empty; nothing to calibrate.")
 
+    label_str = f" [{arm_label}]" if arm_label else ""
     print(
-        "\n--- Calibration controls ---\n"
-        "  左クリック: EE の位置をクリック (最後のクリックが有効)\n"
-        "  c: クリックした点をキャリブに登録して次のフレームへ\n"
+        f"\n--- Calibration controls{label_str} ---\n"
+        "  左クリック: その点を登録して自動的に次のフレームへ\n"
         "  n: 何も登録せずに次のフレームへ\n"
         "  b: 一つ前のフレームに戻る\n"
-        "  q: 終了（登録した点でアフィン推定）\n"
+        "  q: 終了（登録した点でアフィン推定、最低3点必要）\n"
+        "  ※ウィンドウをクリックしてフォーカスしてからキーを押してください\n"
         "----------------------------\n"
     )
 
-    window_name = "fk_image_calibration"
+    window_name = f"fk_image_calibration{label_str}"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
-    clicked_point: List[Tuple[int, int]] = []
-
-    def on_mouse(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            clicked_point.clear()
-            clicked_point.append((x, y))
-            print(f"[CLICK] ({x}, {y})")
-
-    cv2.setMouseCallback(window_name, on_mouse)
+    # クリックで登録＆次フレームに進むためのフラグ
+    clicked_and_registered = [False]
 
     used_frames: List[int] = []
     world_pts: List[np.ndarray] = []
     image_pts: List[Tuple[int, int]] = []
 
+    current_frame_idx = [0]  # クロージャ用
+    current_pos_3d: List[np.ndarray] = [None]
+
+    def on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            # クリックしたら即登録
+            frame_idx = frame_indices[current_frame_idx[0]]
+            pos_3d = current_pos_3d[0]
+            if pos_3d is not None:
+                used_frames.append(frame_idx)
+                world_pts.append(pos_3d.copy())
+                image_pts.append((x, y))
+                print(f"[登録{label_str}] frame {frame_idx}: world={pos_3d}, image=({x},{y}) - 合計{len(used_frames)}点")
+                clicked_and_registered[0] = True
+
+    cv2.setMouseCallback(window_name, on_mouse)
+
     i = 0
-    while 0 <= i < len(frame_indices):
+    quit_requested = False
+    while not quit_requested:
+        # フレーム範囲外になったら最初に戻る
+        if i >= len(frame_indices):
+            print(f"\n[INFO] フレーム終端に到達。最初に戻ります。現在{len(used_frames)}点登録済み。")
+            i = 0
+        if i < 0:
+            i = 0
+
         frame_idx = frame_indices[i]
         pos_3d = frame_to_pos[frame_idx]
+        current_frame_idx[0] = i
+        current_pos_3d[0] = pos_3d
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ok, frame = cap.read()
@@ -326,42 +432,46 @@ def interactive_collect_points(
 
         display = frame.copy()
         h, w = display.shape[:2]
-        info = f"frame {frame_idx}  EE=({pos_3d[0]:.3f},{pos_3d[1]:.3f},{pos_3d[2]:.3f})"
-        cv2.putText(
-            display,
-            info,
-            (10, h - 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA,
-        )
+        
+        # 情報表示
+        info1 = f"{arm_label} frame {frame_idx}/{frame_indices[-1]}  EE=({pos_3d[0]:.3f},{pos_3d[1]:.3f},{pos_3d[2]:.3f})"
+        info2 = f"登録済み: {len(used_frames)}点  (3点以上でq終了可)"
+        cv2.putText(display, info1, (10, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(display, info2, (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2, cv2.LINE_AA)
+        
         cv2.imshow(window_name, display)
 
-        clicked_point.clear()
+        clicked_and_registered[0] = False
         while True:
-            key = cv2.waitKey(50) & 0xFF
-            if key == ord("c"):
-                if not clicked_point:
-                    print("[INFO] No click on this frame yet. Click EE position first.")
-                    continue
-                u, v = clicked_point[0]
-                used_frames.append(frame_idx)
-                world_pts.append(pos_3d.copy())
-                image_pts.append((u, v))
-                print(f"[OK] Registered frame {frame_idx}: world={pos_3d}, image=({u},{v})")
+            key = cv2.waitKeyEx(50)  # waitKeyExを使用してより確実にキーを取得
+            
+            # クリックで登録された場合は自動で次のフレームへ
+            if clicked_and_registered[0]:
                 i += frame_step
                 break
-            elif key == ord("n"):
+            
+            # キーが押されていない場合は-1が返る
+            if key == -1:
+                continue
+            
+            # macOSではキーコードが異なる場合があるので両方チェック
+            key_lower = key & 0xFF
+            
+            if key_lower == ord("n") or key == ord("n"):
+                print("[KEY] n pressed - 次のフレームへ")
                 i += frame_step
                 break
-            elif key == ord("b"):
+            elif key_lower == ord("b") or key == ord("b"):
+                print("[KEY] b pressed - 前のフレームへ")
                 i = max(0, i - frame_step)
                 break
-            elif key == ord("q") or key == 27:  # q or ESC
-                i = len(frame_indices)
-                break
+            elif key_lower == ord("q") or key == ord("q") or key_lower == 27 or key == 27:  # q or ESC
+                print(f"[KEY] q/ESC pressed - 終了リクエスト (現在{len(used_frames)}点)")
+                if len(used_frames) >= 3:
+                    quit_requested = True
+                    break
+                else:
+                    print(f"[WARN] まだ{len(used_frames)}点しか登録されていません。最低3点必要です。")
 
     cv2.destroyWindow(window_name)
     return used_frames, world_pts, image_pts
@@ -399,39 +509,95 @@ def main() -> None:
     # 2. 動画オープン
     cap = open_video(attn_dir, episode, repo_id)
 
-    # 3. FK で EE 軌跡 (3D) を計算
-    frame_to_pos = compute_fk_trajectory(
+    # 3. FK で EE 軌跡 (3D) を計算（双腕対応）
+    frame_to_pos, frame_to_pos_right, arm_mode = compute_fk_trajectory(
         urdf_path=urdf_path,
         ee_link_name=ee_link_name,
         frames=frames,
     )
 
-    # 4. インタラクティブに対応点を集める
-    used_frames, world_pts_3d, image_pts = interactive_collect_points(
-        cap=cap,
-        frame_to_pos=frame_to_pos,
-        frame_step=frame_step,
-    )
+    payload: Dict[str, Any] = {"arm_mode": arm_mode}
 
-    if len(used_frames) < 3:
-        raise RuntimeError(
-            f"Not enough calibration points collected ({len(used_frames)}). "
-            f"Collect at least 3 (click and press 'c')."
+    if arm_mode == "bimanual":
+        # 双腕モード: 左右別々にキャリブレーション
+        print("\n" + "=" * 50)
+        print("BIMANUAL MODE: Calibrating LEFT arm first")
+        print("=" * 50)
+
+        # 左腕のキャリブレーション
+        used_frames_left, world_pts_left, image_pts_left = interactive_collect_points(
+            cap=cap,
+            frame_to_pos=frame_to_pos,
+            frame_step=frame_step,
+            arm_label="LEFT",
         )
 
-    world_xy = np.stack([p[:2] for p in world_pts_3d], axis=0)
-    img_uv = np.array(image_pts, dtype=float)
+        if len(used_frames_left) < 3:
+            raise RuntimeError(
+                f"Not enough calibration points for LEFT arm ({len(used_frames_left)}). "
+                f"Collect at least 3 (click and press 'c')."
+            )
 
-    affine = compute_affine(world_xy, img_uv)
-    print("[RESULT] Estimated affine matrix (2x3):")
-    print(affine)
+        world_xy_left = np.stack([p[:2] for p in world_pts_left], axis=0)
+        img_uv_left = np.array(image_pts_left, dtype=float)
+        affine_left = compute_affine(world_xy_left, img_uv_left)
+        print("[RESULT] Estimated affine matrix for LEFT arm (2x3):")
+        print(affine_left)
+        payload["affine_matrix_left"] = affine_left.tolist()
+
+        print("\n" + "=" * 50)
+        print("BIMANUAL MODE: Now calibrating RIGHT arm")
+        print("=" * 50)
+
+        # 右腕のキャリブレーション
+        used_frames_right, world_pts_right, image_pts_right = interactive_collect_points(
+            cap=cap,
+            frame_to_pos=frame_to_pos_right,
+            frame_step=frame_step,
+            arm_label="RIGHT",
+        )
+
+        if len(used_frames_right) < 3:
+            raise RuntimeError(
+                f"Not enough calibration points for RIGHT arm ({len(used_frames_right)}). "
+                f"Collect at least 3 (click and press 'c')."
+            )
+
+        world_xy_right = np.stack([p[:2] for p in world_pts_right], axis=0)
+        img_uv_right = np.array(image_pts_right, dtype=float)
+        affine_right = compute_affine(world_xy_right, img_uv_right)
+        print("[RESULT] Estimated affine matrix for RIGHT arm (2x3):")
+        print(affine_right)
+        payload["affine_matrix_right"] = affine_right.tolist()
+
+        # 後方互換のためにaffine_matrixも左腕のものを保存
+        payload["affine_matrix"] = affine_left.tolist()
+
+    else:
+        # 単腕モード: 従来通り
+        used_frames, world_pts_3d, image_pts = interactive_collect_points(
+            cap=cap,
+            frame_to_pos=frame_to_pos,
+            frame_step=frame_step,
+        )
+
+        if len(used_frames) < 3:
+            raise RuntimeError(
+                f"Not enough calibration points collected ({len(used_frames)}). "
+                f"Collect at least 3 (click and press 'c')."
+            )
+
+        world_xy = np.stack([p[:2] for p in world_pts_3d], axis=0)
+        img_uv = np.array(image_pts, dtype=float)
+
+        affine = compute_affine(world_xy, img_uv)
+        print("[RESULT] Estimated affine matrix (2x3):")
+        print(affine)
+        payload["affine_matrix"] = affine.tolist()
 
     conf_dir = script_dir / "SO101"
     conf_dir.mkdir(parents=True, exist_ok=True)
     fk_conf_path = conf_dir / "fk_image.conf"
-    payload: Dict[str, Any] = {
-        "affine_matrix": affine.tolist(),
-    }
     fk_conf_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"[SAVE] Calibration saved to: {fk_conf_path}")
     print("=== fk_image_calibration: done ===")
