@@ -291,6 +291,8 @@ class AttentionRecordingManager:
         self._chunk_start_ts = None
         self._chunk_attn = None
         self._chunk_scores = None
+        self._log_frame_call_count = 0
+        self._frames_added_count = 0
 
     def log_frame(
         self,
@@ -302,6 +304,7 @@ class AttentionRecordingManager:
         if not self._enabled or self._episode_buffer is None:
             return
 
+        self._log_frame_call_count += 1
         images_bgr = _extract_images_from_obs_frame(observation_frame)
         attn_samples = self.context.collect_attentions(self._policy, images_bgr) if self.context else []
 
@@ -354,6 +357,7 @@ class AttentionRecordingManager:
                     disp_key = sample.camera_key.split(".")[-1]
                     text = f"{disp_key}: sum {sample.raw_sum:.2f} mean {sample.raw_mean:.3f}"
                     _draw_label(combined_overlay, text, x0 + 10, 10)
+
         else:
             ordered_keys = [
                 key for key in getattr(self._policy.config, "image_features", {}) if key in images_bgr
@@ -364,6 +368,7 @@ class AttentionRecordingManager:
         combined = combined_overlay if combined_overlay is not None else _compose_side_by_side(overlays)
         if combined is not None and self._writer is not None:
             self._writer.add_frame(combined)
+            self._frames_added_count += 1
 
         # カメラ別のオーバーレイ／ヒート動画を書き出す
         for sample in attn_samples:
@@ -411,6 +416,20 @@ class AttentionRecordingManager:
     def finish_episode(self) -> None:
         if not self._enabled or self._episode_buffer is None:
             return
+
+        # Log frame statistics
+        expected_duration = self._log_frame_call_count / self.fps if self.fps > 0 else 0
+        actual_duration = self._frames_added_count / self.fps if self.fps > 0 else 0
+        stats_msg = (
+            f"[attn_recorder] Episode {self._episode_buffer.episode_idx}: "
+            f"log_frame called {self._log_frame_call_count} times, "
+            f"frames added {self._frames_added_count}, "
+            f"fps={self.fps}, "
+            f"expected_video_duration={expected_duration:.1f}s, "
+            f"actual_video_duration={actual_duration:.1f}s"
+        )
+        print(stats_msg)
+        logging.info(stats_msg)
         if self._chunk_actions:
             frame_record = {
                 "frame_idx": self._chunk_start_idx,

@@ -14,9 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .config import RobotConfig
-from .robot import Robot
-from .utils import make_robot_from_config
+from dataclasses import dataclass
 
-# Import robot modules to register them with draccus ChoiceRegistry
-from . import mujoco_sim
+from ..config import TeleoperatorConfig
+
+
+@TeleoperatorConfig.register_subclass("bi_so101_leader")
+@dataclass
+class BiSO101LeaderConfig(TeleoperatorConfig):
+    left_arm_port: str
+    right_arm_port: str
