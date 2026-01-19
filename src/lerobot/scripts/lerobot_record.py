@@ -106,6 +106,7 @@ from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
     bi_so100_follower,
+    bi_so101_follower,
     hope_jr,
     koch_follower,
     make_robot_from_config,
@@ -116,6 +117,7 @@ from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
     bi_so100_leader,
+    bi_so101_leader,
     homunculus,
     koch_leader,
     make_teleoperator_from_config,
@@ -412,12 +414,12 @@ def generate_plan_overlay_if_configured(
         frames = log["frames"]
         repo_id = log.get("repo_id", None)
         cap = viz_open_video(attn_dir, episode_idx, repo_id)
-        chunk_starts, plans_3d = compute_fk_plans(
+        chunk_starts, plans_3d, plans_3d_right, arm_mode = compute_fk_plans(
             urdf_path=urdf_path,
             ee_link_name=ee_link_name,
             frames=frames,
         )
-        affine = load_fk_image_conf()
+        affine, affine_right, config_arm_mode = load_fk_image_conf(attn_dir)
         output_path = attn_dir / f"{output_suffix}_episode_{episode_idx}.mp4"
         overlay_plan_trajectory_video(
             cap=cap,
@@ -425,6 +427,9 @@ def generate_plan_overlay_if_configured(
             plans_3d=plans_3d,
             affine=affine,
             output_path=output_path,
+            plans_3d_right=plans_3d_right,
+            arm_mode=arm_mode,
+            affine_right=affine_right,
         )
         logging.info(f"[plan-overlay] generated: {output_path}")
     except Exception as e:  # noqa: BLE001
