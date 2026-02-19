@@ -16,6 +16,7 @@
 import concurrent.futures
 import contextlib
 import logging
+import os
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -544,7 +545,32 @@ def _encode_video_worker(video_key: str, episode_index: int, root: Path, fps: in
     temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
     fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
     img_dir = (root / fpath).parent
-    encode_video_frames(img_dir, temp_path, fps, overwrite=True)
+    # Allow deployments to opt out of AV1 when realtime playback compatibility matters.
+    vcodec = str(os.environ.get("LEROBOT_VIDEO_VCODEC", "libsvtav1")).strip() or "libsvtav1"
+    pix_fmt = str(os.environ.get("LEROBOT_VIDEO_PIX_FMT", "yuv420p")).strip() or "yuv420p"
+
+    g_raw = str(os.environ.get("LEROBOT_VIDEO_GOP", "2")).strip()
+    crf_raw = str(os.environ.get("LEROBOT_VIDEO_CRF", "30")).strip()
+    fast_decode_raw = str(os.environ.get("LEROBOT_VIDEO_FAST_DECODE", "0")).strip()
+    preset_raw = str(os.environ.get("LEROBOT_VIDEO_PRESET", "")).strip()
+
+    g = int(g_raw) if g_raw else None
+    crf = int(crf_raw) if crf_raw else None
+    fast_decode = int(fast_decode_raw) if fast_decode_raw else 0
+    preset = int(preset_raw) if preset_raw else None
+
+    encode_video_frames(
+        img_dir,
+        temp_path,
+        fps,
+        vcodec=vcodec,
+        pix_fmt=pix_fmt,
+        g=g,
+        crf=crf,
+        fast_decode=fast_decode,
+        preset=preset,
+        overwrite=True,
+    )
     shutil.rmtree(img_dir)
     return temp_path
 
