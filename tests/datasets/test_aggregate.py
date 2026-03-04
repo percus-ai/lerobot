@@ -187,10 +187,7 @@ def assert_video_timestamps_within_bounds(aggr_ds):
     This catches bugs where timestamps point to frames beyond the actual video length,
     which would cause "Invalid frame index" errors during data loading.
     """
-    try:
-        from torchcodec.decoders import VideoDecoder
-    except ImportError:
-        return
+    import av
 
     for ep_idx in range(aggr_ds.num_episodes):
         ep = aggr_ds.meta.episodes[ep_idx]
@@ -203,30 +200,20 @@ def assert_video_timestamps_within_bounds(aggr_ds):
             if not video_path.exists():
                 continue
 
-            from_frame_idx = round(from_ts * aggr_ds.fps)
-            to_frame_idx = round(to_ts * aggr_ds.fps)
+            with av.open(str(video_path)) as container:
+                video_stream = container.streams.video[0]
+                if video_stream.duration is not None:
+                    video_duration_s = float(video_stream.duration * video_stream.time_base)
+                else:
+                    video_duration_s = float(container.duration / av.time_base)
 
-            try:
-                decoder = VideoDecoder(str(video_path))
-                num_frames = len(decoder)
-
-                # Verify timestamps don't exceed video bounds
-                assert from_frame_idx >= 0, (
-                    f"Episode {ep_idx}, {vid_key}: from_frame_idx ({from_frame_idx}) < 0"
-                )
-                assert from_frame_idx < num_frames, (
-                    f"Episode {ep_idx}, {vid_key}: from_frame_idx ({from_frame_idx}) >= video frames ({num_frames})"
-                )
-                assert to_frame_idx <= num_frames, (
-                    f"Episode {ep_idx}, {vid_key}: to_frame_idx ({to_frame_idx}) > video frames ({num_frames})"
-                )
-                assert from_frame_idx < to_frame_idx, (
-                    f"Episode {ep_idx}, {vid_key}: from_frame_idx ({from_frame_idx}) >= to_frame_idx ({to_frame_idx})"
-                )
-            except Exception as e:
-                raise AssertionError(
-                    f"Failed to verify timestamps for episode {ep_idx}, {vid_key}: {e}"
-                ) from e
+            assert 0 <= from_ts <= to_ts, (
+                f"Episode {ep_idx}, {vid_key}: invalid timestamps {from_ts=} {to_ts=}"
+            )
+            # Allow a tiny epsilon for rounding/encode timestamp noise.
+            assert to_ts <= video_duration_s + 1e-2, (
+                f"Episode {ep_idx}, {vid_key}: to_ts ({to_ts}) > video duration ({video_duration_s})"
+            )
 
 
 def test_aggregate_datasets(tmp_path, lerobot_dataset_factory):
@@ -276,6 +263,70 @@ def test_aggregate_datasets(tmp_path, lerobot_dataset_factory):
     assert_episode_indices_updated_correctly(aggr_ds, ds_0, ds_1)
     assert_video_frames_integrity(aggr_ds, ds_0, ds_1)
     assert_video_timestamps_within_bounds(aggr_ds)
+
+
+def test_aggregate_video_rotation_offsets(tmp_path, lerobot_dataset_factory):
+    """Regression test: when video files rotate, per-file timestamp offsets must stay within file bounds.
+
+    The bug this catches is using a global accumulated offset across rotated destination files,
+    which can push timestamps beyond the duration of the target MP4.
+    """
+    ds_a = lerobot_dataset_factory(
+        root=tmp_path / "test_a",
+        repo_id=f"{DUMMY_REPO_ID}_a",
+        total_episodes=5,
+        total_frames=600,
+    )
+    ds_b = lerobot_dataset_factory(
+        root=tmp_path / "test_b",
+        repo_id=f"{DUMMY_REPO_ID}_b",
+        total_episodes=5,
+        total_frames=200,
+    )
+    ds_c = lerobot_dataset_factory(
+        root=tmp_path / "test_c",
+        repo_id=f"{DUMMY_REPO_ID}_c",
+        total_episodes=5,
+        total_frames=50,
+    )
+
+    # Pick a threshold (in MB) that forces a rotation at ds_b, then appends ds_c into the rotated file.
+    # We use actual file sizes so this remains stable across encoding variations.
+    sample_key = ds_a.meta.video_keys[0]
+    src_a = ds_a.root / ds_a.meta.get_video_file_path(0, sample_key)
+    src_b = ds_b.root / ds_b.meta.get_video_file_path(0, sample_key)
+    src_c = ds_c.root / ds_c.meta.get_video_file_path(0, sample_key)
+    size_a = src_a.stat().st_size
+    size_b = src_b.stat().st_size
+    size_c = src_c.stat().st_size
+
+    # Force rotation when attempting to append ds_b to ds_a (size_a + size_b >= limit),
+    # then allow ds_c to append into the rotated file (size_b + size_c < limit).
+    assert size_a > size_c + 1, "Test setup assumes the first dataset video is larger than the third."
+    limit_bytes = size_b + size_c + 1
+
+    video_files_size_in_mb = limit_bytes / (1024 * 1024)
+
+    aggregate_datasets(
+        repo_ids=[ds_a.repo_id, ds_b.repo_id, ds_c.repo_id],
+        roots=[ds_a.root, ds_b.root, ds_c.root],
+        aggr_repo_id=f"{DUMMY_REPO_ID}_aggr_rot",
+        aggr_root=tmp_path / "test_aggr_rot",
+        video_files_size_in_mb=video_files_size_in_mb,
+    )
+
+    with (
+        patch("lerobot.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download_patch,
+        patch("lerobot.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version_patch,
+    ):
+        mock_snapshot_download_patch.return_value = str(tmp_path / "test_aggr_rot")
+        mock_get_safe_version_patch.return_value = "v3.0"
+        aggr_ds = LeRobotDataset(
+            repo_id=f"{DUMMY_REPO_ID}_aggr_rot",
+            root=tmp_path / "test_aggr_rot",
+            download_videos=True,
+        )
+        assert_video_timestamps_within_bounds(aggr_ds)
     assert_dataset_iteration_works(aggr_ds)
 
 

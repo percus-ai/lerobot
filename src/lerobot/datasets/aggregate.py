@@ -136,44 +136,22 @@ def update_meta_data(
         df["_orig_chunk"] = df[orig_chunk_col].copy()
         df["_orig_file"] = df[orig_file_col].copy()
 
-        # Get mappings for this video key
-        src_to_offset = video_idx.get("src_to_offset", {})
+        # Update chunk/file per source file if mapping exists; otherwise use final indices
         src_to_dst = video_idx.get("src_to_dst", {})
+        src_to_offset = video_idx.get("src_to_offset", {})
+        if not src_to_dst:
+            raise ValueError(f"Missing video index mapping for key: {key}")
 
-        # Apply per-source-file mappings
-        if src_to_dst:
-            # Map each episode to its correct destination file and apply offset
-            for idx in df.index:
-                # Convert to Python int to avoid numpy type mismatch in dict lookup
-                src_key = (int(df.at[idx, "_orig_chunk"]), int(df.at[idx, "_orig_file"]))
+        for idx in df.index:
+            # Convert to Python int to avoid numpy scalar dict-key mismatches.
+            src_key = (int(df.at[idx, "_orig_chunk"]), int(df.at[idx, "_orig_file"]))
+            dst_chunk, dst_file = src_to_dst.get(src_key, (video_idx["chunk"], video_idx["file"]))
+            offset = src_to_offset.get(src_key, 0)
 
-                # Get destination chunk/file for this source file
-                dst_chunk, dst_file = src_to_dst.get(src_key, (video_idx["chunk"], video_idx["file"]))
-                df.at[idx, orig_chunk_col] = dst_chunk
-                df.at[idx, orig_file_col] = dst_file
-
-                # Apply timestamp offset
-                offset = src_to_offset.get(src_key, 0)
-                df.at[idx, f"videos/{key}/from_timestamp"] += offset
-                df.at[idx, f"videos/{key}/to_timestamp"] += offset
-        elif src_to_offset:
-            # Fallback: use same destination for all, but apply per-file offsets
-            df[orig_chunk_col] = video_idx["chunk"]
-            df[orig_file_col] = video_idx["file"]
-            for idx in df.index:
-                # Convert to Python int to avoid numpy type mismatch in dict lookup
-                src_key = (int(df.at[idx, "_orig_chunk"]), int(df.at[idx, "_orig_file"]))
-                offset = src_to_offset.get(src_key, 0)
-                df.at[idx, f"videos/{key}/from_timestamp"] += offset
-                df.at[idx, f"videos/{key}/to_timestamp"] += offset
-        else:
-            # Fallback to simple offset (for backward compatibility)
-            df[orig_chunk_col] = video_idx["chunk"]
-            df[orig_file_col] = video_idx["file"]
-            df[f"videos/{key}/from_timestamp"] = (
-                df[f"videos/{key}/from_timestamp"] + video_idx["latest_duration"]
-            )
-            df[f"videos/{key}/to_timestamp"] = df[f"videos/{key}/to_timestamp"] + video_idx["latest_duration"]
+            df.at[idx, orig_chunk_col] = dst_chunk
+            df.at[idx, orig_file_col] = dst_file
+            df.at[idx, f"videos/{key}/from_timestamp"] += offset
+            df.at[idx, f"videos/{key}/to_timestamp"] += offset
 
         # Clean up temporary columns
         df = df.drop(columns=["_orig_chunk", "_orig_file"])
@@ -249,7 +227,7 @@ def aggregate_datasets(
     meta_idx = {"chunk": 0, "file": 0}
     data_idx = {"chunk": 0, "file": 0}
     videos_idx = {
-        key: {"chunk": 0, "file": 0, "latest_duration": 0, "episode_duration": 0} for key in video_keys
+        key: {"chunk": 0, "file": 0, "episode_duration": 0, "dst_file_durations": {}} for key in video_keys
     }
 
     dst_meta.episodes = {}
@@ -285,14 +263,12 @@ def aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chu
     """
     for key in videos_idx:
         videos_idx[key]["episode_duration"] = 0
-        # Track offset for each source (chunk, file) pair
+        # Track offset for each source (chunk, file) pair.
         videos_idx[key]["src_to_offset"] = {}
-        # Track destination (chunk, file) for each source (chunk, file) pair
+        # Track destination (chunk, file) for each source (chunk, file) pair.
         videos_idx[key]["src_to_dst"] = {}
-        # Initialize dst_file_durations if not present
-        # dst_file_durations tracks duration of each destination file
-        if "dst_file_durations" not in videos_idx[key]:
-            videos_idx[key]["dst_file_durations"] = {}
+        # dst_file_durations tracks duration of each destination file for stable offsets.
+        videos_idx[key].setdefault("dst_file_durations", {})
 
     for key, video_idx in videos_idx.items():
         unique_chunk_file_pairs = {
@@ -310,9 +286,10 @@ def aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chu
         dst_file_durations = video_idx["dst_file_durations"]
 
         for src_chunk_idx, src_file_idx in unique_chunk_file_pairs:
-            # Convert to Python int to ensure consistent dict keys
+            # Convert to Python int to avoid numpy scalar dict-key mismatches.
             src_chunk_idx = int(src_chunk_idx)
             src_file_idx = int(src_file_idx)
+
             src_path = src_meta.root / DEFAULT_VIDEO_PATH.format(
                 video_key=key,
                 chunk_index=src_chunk_idx,
@@ -329,12 +306,11 @@ def aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chu
             dst_key = (chunk_idx, file_idx)
 
             if not dst_path.exists():
-                # New destination file: offset is 0
+                # New destination file: offset is 0.
                 videos_idx[key]["src_to_offset"][(src_chunk_idx, src_file_idx)] = 0
                 videos_idx[key]["src_to_dst"][(src_chunk_idx, src_file_idx)] = dst_key
                 dst_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy(str(src_path), str(dst_path))
-                # Track duration of this destination file
                 dst_file_durations[dst_key] = src_duration
                 videos_idx[key]["episode_duration"] += src_duration
                 continue
@@ -344,31 +320,30 @@ def aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chu
             dst_size = get_file_size_in_mb(dst_path)
 
             if dst_size + src_size >= video_files_size_in_mb:
-                # Rotate to a new file - offset is 0
+                # Rotate to a new file: this source becomes start of new destination.
                 chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, chunk_size)
                 dst_key = (chunk_idx, file_idx)
                 videos_idx[key]["src_to_offset"][(src_chunk_idx, src_file_idx)] = 0
+                videos_idx[key]["src_to_dst"][(src_chunk_idx, src_file_idx)] = dst_key
                 dst_path = dst_meta.root / DEFAULT_VIDEO_PATH.format(
                     video_key=key,
                     chunk_index=chunk_idx,
                     file_index=file_idx,
                 )
-                videos_idx[key]["src_to_dst"][(src_chunk_idx, src_file_idx)] = dst_key
                 dst_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy(str(src_path), str(dst_path))
-                # Track duration of this new destination file
                 dst_file_durations[dst_key] = src_duration
             else:
-                # Append to existing destination file
-                # Offset is the current duration of this destination file
-                current_dst_duration = dst_file_durations.get(dst_key, 0)
+                # Append to existing destination file: offset is current duration of this destination file.
+                current_dst_duration = dst_file_durations.get(dst_key)
+                if current_dst_duration is None:
+                    current_dst_duration = get_video_duration_in_s(dst_path)
                 videos_idx[key]["src_to_offset"][(src_chunk_idx, src_file_idx)] = current_dst_duration
                 videos_idx[key]["src_to_dst"][(src_chunk_idx, src_file_idx)] = dst_key
                 concatenate_video_files(
                     [dst_path, src_path],
                     dst_path,
                 )
-                # Update duration of this destination file
                 dst_file_durations[dst_key] = current_dst_duration + src_duration
 
             videos_idx[key]["episode_duration"] += src_duration
@@ -470,10 +445,6 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
             contains_images=False,
             aggr_root=dst_meta.root,
         )
-
-    # Increment latest_duration by the total duration added from this source dataset
-    for k in videos_idx:
-        videos_idx[k]["latest_duration"] += videos_idx[k]["episode_duration"]
 
     return meta_idx
 

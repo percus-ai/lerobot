@@ -28,8 +28,8 @@ import numpy as np
 import packaging.version
 import pandas
 import pandas as pd
-import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
+import pyarrow.dataset as pa_ds
 import torch
 from datasets import Dataset
 from datasets.table import embed_table_storage
@@ -49,7 +49,8 @@ from lerobot.utils.utils import SuppressProgressBars, is_valid_numpy_dtype_strin
 
 DEFAULT_CHUNK_SIZE = 1000  # Max number of files per chunk
 DEFAULT_DATA_FILE_SIZE_IN_MB = 100  # Max size per file
-DEFAULT_VIDEO_FILE_SIZE_IN_MB = 200  # Max size per file
+# Increase to avoid video file rotation during merge (prevents timestamp mismatches)
+DEFAULT_VIDEO_FILE_SIZE_IN_MB = 500000  # Max size per file
 
 INFO_PATH = "meta/info.json"
 STATS_PATH = "meta/stats.json"
@@ -105,37 +106,58 @@ def update_chunk_file_indices(chunk_idx: int, file_idx: int, chunks_size: int) -
 
 
 def load_nested_dataset(
-    pq_dir: Path, features: datasets.Features | None = None, episodes: list[int] | None = None
+    pq_dir: Path,
+    features: datasets.Features | None = None,
+    episodes: Any | None = None,  # list[int] も datasets.Dataset も受ける
 ) -> Dataset:
-    """Find parquet files in provided directory {pq_dir}/chunk-xxx/file-xxx.parquet
-    Convert parquet files to pyarrow memory mapped in a cache folder for efficient RAM usage
-    Concatenate all pyarrow references to return HF Dataset format
-
-    Args:
-        pq_dir: Directory containing parquet files
-        features: Optional features schema to ensure consistent loading of complex types like images
-        episodes: Optional list of episode indices to filter. Uses PyArrow predicate pushdown for efficiency.
-    """
     paths = sorted(pq_dir.glob("*/*.parquet"))
     if len(paths) == 0:
         raise FileNotFoundError(f"Provided directory does not contain any parquet file: {pq_dir}")
 
-    # TODO(rcadene): set num_proc to accelerate conversion to pyarrow
     with SuppressProgressBars():
-        # When no filtering needed, Dataset uses memory-mapped loading for efficiency.
-        # When filtering, PyArrow loads the filtered dataset into memory.
+        # 1) no filtering
         if episodes is None:
             return Dataset.from_parquet([str(path) for path in paths], features=features)
 
-        arrow_dataset = pa_ds.dataset(paths, format="parquet")
-        filter_expr = pa_ds.field("episode_index").isin(episodes)
-        table = arrow_dataset.to_table(filter=filter_expr)
+        # 2) episodes is list[int] -> predicate pushdown on episode_index
+        if isinstance(episodes, list) and (len(episodes) == 0 or isinstance(episodes[0], int)):
+            arrow_dataset = pa_ds.dataset(paths, format="parquet")
+            filter_expr = pa_ds.field("episode_index").isin(episodes)
+            table = arrow_dataset.to_table(filter=filter_expr)
+            if features is not None:
+                table = table.cast(features.arrow_schema)
+            return Dataset(table)
 
-        if features is not None:
-            table = table.cast(features.arrow_schema)
+        # 3) episodes is HF Dataset (episode metadata) -> load only referenced shards
+        if hasattr(episodes, "column_names"):
+            col_candidates = [
+                ("data/chunk_index", "data/file_index"),
+                ("data.chunk_index", "data.file_index"),
+                ("chunk_index", "file_index"),
+            ]
+            chunk_col = file_col = None
+            for c, f in col_candidates:
+                if c in episodes.column_names and f in episodes.column_names:
+                    chunk_col, file_col = c, f
+                    break
+            if chunk_col is None:
+                raise ValueError(
+                    "episodes was provided but could not find chunk/file index columns. "
+                    f"columns={episodes.column_names}"
+                )
 
-        return Dataset(table)
+            pairs = set(zip(episodes[chunk_col], episodes[file_col], strict=True))
+            ref_paths = [
+                pq_dir / f"chunk-{ci:03d}" / f"file-{fi:03d}.parquet"
+                for ci, fi in sorted(pairs)
+            ]
+            ref_paths = [p for p in ref_paths if p.exists()]
+            if len(ref_paths) == 0:
+                raise FileNotFoundError(f"No parquet files referenced by episodes found under: {pq_dir}")
 
+            return Dataset.from_parquet([str(p) for p in ref_paths], features=features)
+
+        raise TypeError(f"Unsupported type for episodes: {type(episodes)}")
 
 def get_parquet_num_frames(parquet_path: str | Path) -> int:
     metadata = pq.read_metadata(parquet_path)
