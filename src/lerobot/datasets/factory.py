@@ -35,6 +35,17 @@ IMAGENET_STATS = {
 }
 
 
+def _apply_imagenet_stats_to_camera_keys(dataset: LeRobotDataset | MultiLeRobotDataset) -> None:
+    if dataset.meta.stats is None:
+        dataset.meta.stats = {}
+
+    for key in dataset.meta.camera_keys:
+        if dataset.meta.stats.get(key) is None:
+            dataset.meta.stats[key] = {}
+        for stats_type, stats in IMAGENET_STATS.items():
+            dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+
+
 def resolve_delta_timestamps(
     cfg: PreTrainedConfig, ds_meta: LeRobotDatasetMetadata
 ) -> dict[str, list] | None:
@@ -124,8 +135,6 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         )
 
     if cfg.dataset.use_imagenet_stats:
-        for key in dataset.meta.camera_keys:
-            for stats_type, stats in IMAGENET_STATS.items():
-                dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+        _apply_imagenet_stats_to_camera_keys(dataset)
 
     return dataset
