@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -36,6 +37,7 @@ from lerobot.configs.types import (
     PolicyFeature,
 )
 from lerobot.policies.groot.configuration_groot import GrootConfig
+from lerobot.policies.groot.eagle2_hg_model.processing_eagle2_5_vl import Eagle25VLProcessorKwargs
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -149,6 +151,7 @@ def make_groot_pre_post_processors(
         # 5. Collate eagle_content -> eagle_* tensors
         GrootEagleCollateStep(
             tokenizer_assets_repo=config.tokenizer_assets_repo,
+            image_processor_device=config.device,
         ),
         # 6. Move to device
         DeviceProcessorStep(device=config.device),
@@ -491,8 +494,82 @@ class GrootEagleEncodeStep(ProcessorStep):
         return features
 
 
+def _collate_eagle_content(
+    values: list[dict[str, Any]],
+    eagle_processor: ProcessorMixin,
+    *,
+    image_processor_device: str | torch.device | None = None,
+) -> dict[str, Any]:
+    text_list: list[str] = []
+    image_inputs: list[Any] = []
+    image_counts: list[int] = []
+
+    for value in values:
+        curr_text_list = list(value["text_list"])
+        curr_image_inputs = list(value["image_inputs"])
+        if len(curr_text_list) != 1:
+            raise ValueError("GROOT Eagle collate expects one text prompt per batch item")
+        if value.get("video_inputs"):
+            raise ValueError("GROOT Eagle collate does not support video inputs")
+        text_list.extend(curr_text_list)
+        image_inputs.extend(curr_image_inputs)
+        image_counts.append(len(curr_image_inputs))
+
+    images_kwargs: dict[str, Any] = {
+        "min_dynamic_tiles": 1,
+        "max_dynamic_tiles": 1,
+        "use_thumbnail": False,
+    }
+    if image_processor_device is not None:
+        images_kwargs["device"] = image_processor_device
+
+    output_kwargs = eagle_processor._merge_kwargs(
+        Eagle25VLProcessorKwargs,
+        tokenizer_init_kwargs=eagle_processor.tokenizer.init_kwargs,
+        images_kwargs=images_kwargs,
+        return_tensors="pt",
+        padding=True,
+    )
+    image_outputs = eagle_processor.image_processor(
+        images=image_inputs,
+        videos=None,
+        **output_kwargs["images_kwargs"],
+    )
+
+    image_placeholder = re.escape(eagle_processor.image_placeholder)
+    video_placeholder = re.escape(eagle_processor.video_placeholder)
+    placeholder_pattern = re.compile(rf"<({image_placeholder}|{video_placeholder})-(\d+)>")
+    token_count = eagle_processor.tokens_per_tile
+    rewritten_text: list[str] = []
+
+    for text, image_count in zip(text_list, image_counts, strict=True):
+        def replace_placeholder(match: re.Match[str]) -> str:
+            media_type = match.group(1)
+            image_index = int(match.group(2)) - 1
+            if media_type != eagle_processor.image_placeholder:
+                raise ValueError("GROOT Eagle collate does not support video placeholders")
+            if image_index < 0 or image_index >= image_count:
+                raise IndexError(f"Image placeholder index out of range: {image_index + 1}")
+            return (
+                f"<image {image_index + 1}>"
+                f"{eagle_processor.image_start_token}"
+                f"{eagle_processor.image_token * token_count}"
+                f"{eagle_processor.image_end_token}"
+            )
+
+        rewritten_text.append(placeholder_pattern.sub(replace_placeholder, text))
+
+    text_outputs = eagle_processor.tokenizer(rewritten_text, **output_kwargs["text_kwargs"])
+    return {f"eagle_{key}": value for key, value in {**text_outputs, **image_outputs}.items()}
+
+
 # Original GR00T-style collate: converts eagle_content -> eagle_* tensors
-def collate(features: list[dict[str, Any]], eagle_processor: ProcessorMixin) -> dict[str, Any]:
+def collate(
+    features: list[dict[str, Any]],
+    eagle_processor: ProcessorMixin,
+    *,
+    image_processor_device: str | torch.device | None = None,
+) -> dict[str, Any]:
     batch: dict[str, Any] = {}
     keys = features[0].keys()
 
@@ -500,23 +577,13 @@ def collate(features: list[dict[str, Any]], eagle_processor: ProcessorMixin) -> 
         values = [elem[key] for elem in features]
 
         if key == "eagle_content":
-            text_list: list[str] = []
-            image_inputs: list[Any] = []
-            for v in values:
-                curr_text_list = v["text_list"]
-                curr_image_inputs = v["image_inputs"]
-                text_list += curr_text_list
-                image_inputs += curr_image_inputs
-            eagle_inputs = eagle_processor(
-                text=text_list,
-                images=image_inputs,
-                images_kwargs={"min_dynamic_tiles": 1, "max_dynamic_tiles": 1, "use_thumbnail": False},
-                return_tensors="pt",
-                padding=True,
+            batch.update(
+                _collate_eagle_content(
+                    values,
+                    eagle_processor,
+                    image_processor_device=image_processor_device,
+                )
             )
-            for k, v in eagle_inputs.items():
-                k = "eagle_" + k
-                batch[k] = v
         elif key in ("pixel_values", "image_grid_thw", "attention_mask", "input_ids"):
             # Concat in existing batch dimension.
             batch[key] = torch.cat(values)
@@ -531,6 +598,7 @@ def collate(features: list[dict[str, Any]], eagle_processor: ProcessorMixin) -> 
 @ProcessorStepRegistry.register(name="groot_eagle_collate_v3")
 class GrootEagleCollateStep(ProcessorStep):
     tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO
+    image_processor_device: str | None = None
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
 
     @property
@@ -548,7 +616,7 @@ class GrootEagleCollateStep(ProcessorStep):
 
         # Build features list as original API expects: one dict per batch item
         features = [{"eagle_content": content} for content in contents]
-        batched = collate(features, self.proc)
+        batched = collate(features, self.proc, image_processor_device=self.image_processor_device)
 
         # Inject eagle_* tensors and remove the temporary content and raw video to free memory
         for k, v in batched.items():

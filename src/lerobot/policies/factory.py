@@ -239,6 +239,9 @@ def make_pre_post_processors(
                 "stats": kwargs.get("dataset_stats"),
                 "normalize_min_max": True,
             }
+            preprocessor_overrides["groot_eagle_collate_v3"] = {
+                "image_processor_device": policy_cfg.device,
+            }
 
             # Also ensure postprocessing slices to env action dim and unnormalizes with dataset stats
             env_action_dim = policy_cfg.output_features["action"].shape[0]
