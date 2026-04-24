@@ -1227,7 +1227,12 @@ class PI0Policy(PreTrainedPolicy):
 
         return actions
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
+    def forward(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        return_loss_components: bool = True,
+    ) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training."""
 
         # Prepare inputs
@@ -1244,6 +1249,8 @@ class PI0Policy(PreTrainedPolicy):
         losses = losses[:, :, :original_action_dim]
 
         loss = losses.mean()
+        if not return_loss_components:
+            return loss, {}
 
         loss_dict = {
             "loss": loss.item(),
