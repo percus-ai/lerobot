@@ -68,7 +68,8 @@ class PI05Config(PreTrainedConfig):
     # Training settings
     gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory optimization
     compile_model: bool = False  # Whether to use torch.compile for model optimization
-    compile_mode: str = "max-autotune"  # Torch compile mode
+    # Keep torch.compile enabled while avoiding the CUDA graph path that fails on B200/sm100 validation.
+    compile_mode: str = "max-autotune-no-cudagraphs"  # Torch compile mode
     device: str | None = None  # Device to use for the model (None = auto-detect)
 
     # Optimizer settings: see openpi `AdamW`
