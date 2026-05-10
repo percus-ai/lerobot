@@ -58,6 +58,9 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
+PI05ForwardBackend = Literal["auto", "compiled", "eager"]
+
+
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "mps" and target_dtype == torch.float64:
@@ -534,7 +537,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
-        # Compile model if requested
+        self._forward_eager = self.forward
+
+        # Compile model if requested.
+        # The compiled loss forward is used for training only. On B200/sm100,
+        # validation/eval loss forward can hit an Inductor/Triton illegal-memory
+        # failure even with no-cudagraph compile mode, so PI05Policy routes eval
+        # forward calls to forward_eager while preserving training compile.
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
@@ -743,6 +752,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
         return F.mse_loss(u_t, v_t, reduction="none")
+
+    def forward_eager(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+        """Run the uncompiled loss forward for eval/validation stability."""
+        return self._forward_eager(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            actions,
+            noise=noise,
+            time=time,
+        )
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -1206,6 +1227,7 @@ class PI05Policy(PreTrainedPolicy):
         batch: dict[str, Tensor],
         *,
         return_loss_components: bool = True,
+        forward_backend: PI05ForwardBackend = "auto",
     ) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training."""
 
@@ -1216,7 +1238,11 @@ class PI05Policy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        resolved_forward_backend = self._resolve_forward_backend(forward_backend)
+        if resolved_forward_backend == "compiled":
+            losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        else:
+            losses = self.model.forward_eager(images, img_masks, tokens, masks, actions)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1232,3 +1258,14 @@ class PI05Policy(PreTrainedPolicy):
         }
 
         return loss, loss_dict
+
+    def _resolve_forward_backend(self, forward_backend: PI05ForwardBackend) -> Literal["compiled", "eager"]:
+        if forward_backend == "eager":
+            return "eager"
+        if forward_backend == "compiled":
+            if not self.config.compile_model:
+                raise RuntimeError("PI05 compiled forward was requested but config.compile_model is false")
+            return "compiled"
+        if self.training and self.config.compile_model:
+            return "compiled"
+        return "eager"
