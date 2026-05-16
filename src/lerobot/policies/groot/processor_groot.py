@@ -37,7 +37,6 @@ from lerobot.configs.types import (
     PolicyFeature,
 )
 from lerobot.policies.groot.configuration_groot import GrootConfig
-from lerobot.policies.groot.eagle2_hg_model.processing_eagle2_5_vl import Eagle25VLProcessorKwargs
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -193,6 +192,12 @@ def _to_uint8_np_bhwc(img_t: torch.Tensor) -> np.ndarray:
 
 
 def _build_eagle_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO) -> ProcessorMixin:
+    if AutoProcessor is None:
+        raise ImportError(
+            "GROOT Eagle processor requires the transformers dependency. "
+            "Install LeRobot with the 'groot' extra or use a GROOT training environment."
+        )
+
     # Validate that the cache directory is ready. If not, instruct the user.
     cache_dir = HF_LEROBOT_HOME / tokenizer_assets_repo
     required = [
@@ -522,6 +527,8 @@ def _collate_eagle_content(
     }
     if image_processor_device is not None:
         images_kwargs["device"] = image_processor_device
+
+    from lerobot.policies.groot.eagle2_hg_model.processing_eagle2_5_vl import Eagle25VLProcessorKwargs
 
     output_kwargs = eagle_processor._merge_kwargs(
         Eagle25VLProcessorKwargs,
