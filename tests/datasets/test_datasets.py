@@ -109,6 +109,44 @@ def test_dataset_initialization(tmp_path, lerobot_dataset_factory):
     assert dataset.num_frames == len(dataset)
 
 
+class _DeltaColumn:
+    def __init__(self, values: list[torch.Tensor]) -> None:
+        self._values = values
+
+    def __getitem__(self, indices: list[int]) -> list[torch.Tensor]:
+        return [self._values[index] for index in indices]
+
+
+class _ColumnOnlyHfDataset:
+    def __init__(self) -> None:
+        self.column_keys: list[str] = []
+        self._columns = {
+            ACTION: _DeltaColumn([torch.tensor([float(index)]) for index in range(5)]),
+        }
+
+    def __getitem__(self, key: str) -> _DeltaColumn:
+        assert isinstance(key, str), "delta queries must access a single feature column"
+        self.column_keys.append(key)
+        return self._columns[key]
+
+
+class _MetaWithoutVideos:
+    video_keys: list[str] = []
+
+
+def test_query_hf_dataset_reads_delta_columns_without_row_materialization():
+    dataset = LeRobotDataset.__new__(LeRobotDataset)
+    hf_dataset = _ColumnOnlyHfDataset()
+    dataset.hf_dataset = hf_dataset
+    dataset.meta = _MetaWithoutVideos()
+    dataset._absolute_to_relative_idx = None
+
+    result = dataset._query_hf_dataset({ACTION: [1, 2, 4]})
+
+    assert hf_dataset.column_keys == [ACTION]
+    assert torch.equal(result[ACTION], torch.tensor([[1.0], [2.0], [4.0]]))
+
+
 # TODO(rcadene, aliberts): do not run LeRobotDataset.create, instead refactor LeRobotDatasetMetadata.create
 # and test the small resulting function that validates the features
 def test_dataset_feature_with_forward_slash_raises_error():
