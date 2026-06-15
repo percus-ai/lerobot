@@ -201,6 +201,8 @@ class ProcessorConfigKwargs(TypedDict, total=False):
 def make_pre_post_processors(
     policy_cfg: PreTrainedConfig,
     pretrained_path: str | None = None,
+    *,
+    pretrained_revision: str | None = None,
     **kwargs: Unpack[ProcessorConfigKwargs],
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
@@ -253,6 +255,7 @@ def make_pre_post_processors(
             kwargs["preprocessor_overrides"] = preprocessor_overrides
             kwargs["postprocessor_overrides"] = postprocessor_overrides
 
+        hub_revision_kwargs = {"revision": pretrained_revision} if pretrained_revision else {}
         return (
             PolicyProcessorPipeline.from_pretrained(
                 pretrained_model_name_or_path=pretrained_path,
@@ -262,6 +265,7 @@ def make_pre_post_processors(
                 overrides=kwargs.get("preprocessor_overrides", {}),
                 to_transition=batch_to_transition,
                 to_output=transition_to_batch,
+                **hub_revision_kwargs,
             ),
             PolicyProcessorPipeline.from_pretrained(
                 pretrained_model_name_or_path=pretrained_path,
@@ -271,6 +275,7 @@ def make_pre_post_processors(
                 overrides=kwargs.get("postprocessor_overrides", {}),
                 to_transition=policy_action_to_transition,
                 to_output=transition_to_policy_action,
+                **hub_revision_kwargs,
             ),
         )
 
@@ -389,6 +394,8 @@ def make_policy(
     ds_meta: LeRobotDatasetMetadata | None = None,
     env_cfg: EnvConfig | None = None,
     rename_map: dict[str, str] | None = None,
+    *,
+    pretrained_revision: str | None = None,
 ) -> PreTrainedPolicy:
     """
     Instantiate a policy model.
@@ -463,6 +470,8 @@ def make_policy(
         # Load a pretrained policy and override the config if needed (for example, if there are inference-time
         # hyperparameters that we want to vary).
         kwargs["pretrained_name_or_path"] = cfg.pretrained_path
+        if pretrained_revision:
+            kwargs["revision"] = pretrained_revision
         policy = policy_cls.from_pretrained(**kwargs)
     else:
         # Make a fresh policy.
