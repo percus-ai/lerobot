@@ -13,7 +13,7 @@
 # limitations under the License.
 
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=71.0.0,<80.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project.urls]
