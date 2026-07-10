@@ -29,6 +29,7 @@ from lerobot.datasets.dataset_tools import (
     remove_feature,
     split_dataset,
 )
+from lerobot.datasets.video_utils import VIDEO_TIMESTAMP_TOLERANCE_KEY
 from lerobot.scripts.lerobot_edit_dataset import convert_dataset_to_videos
 
 
@@ -292,6 +293,81 @@ def test_merge_empty_list(tmp_path):
     """Test error when merging empty list."""
     with pytest.raises(ValueError, match="No datasets to merge"):
         merge_datasets([], output_repo_id="merged", output_dir=tmp_path)
+
+
+def test_dataset_tools_preserve_video_timestamp_tolerance(
+    tmp_path,
+    info_factory,
+    lerobot_dataset_factory,
+):
+    info = info_factory(total_episodes=3, total_frames=30, total_tasks=1)
+    info[VIDEO_TIMESTAMP_TOLERANCE_KEY] = 0.07
+    source = lerobot_dataset_factory(
+        root=tmp_path / "source",
+        repo_id="source",
+        info=info,
+    )
+
+    with (
+        patch("lerobot.datasets.lerobot_dataset.get_safe_version", return_value="v3.0"),
+        patch(
+            "lerobot.datasets.lerobot_dataset.snapshot_download",
+            side_effect=lambda _repo_id, **kwargs: str(kwargs.get("local_dir", tmp_path)),
+        ),
+    ):
+        filtered = delete_episodes(source, [2], output_dir=tmp_path / "filtered")
+        splits = split_dataset(filtered, {"train": [0], "val": [1]}, output_dir=tmp_path / "splits")
+        modified = modify_features(
+            filtered,
+            remove_features="state",
+            output_dir=tmp_path / "modified",
+        )
+
+    for dataset in [filtered, *splits.values(), modified]:
+        assert dataset.meta.info[VIDEO_TIMESTAMP_TOLERANCE_KEY] == pytest.approx(0.07)
+        assert dataset.video_timestamp_tolerance_s == pytest.approx(0.07)
+        assert dataset.tolerance_s == pytest.approx(1e-4)
+
+
+def test_merge_uses_maximum_resolved_video_timestamp_tolerance(
+    tmp_path,
+    info_factory,
+    lerobot_dataset_factory,
+):
+    vfr_info = info_factory(total_episodes=1, total_frames=10, total_tasks=1)
+    vfr_info[VIDEO_TIMESTAMP_TOLERANCE_KEY] = 0.05
+    vfr_dataset = lerobot_dataset_factory(
+        root=tmp_path / "vfr",
+        repo_id="vfr",
+        info=vfr_info,
+        tolerance_s=0.08,
+    )
+    cfr_info = info_factory(total_episodes=1, total_frames=10, total_tasks=1)
+    cfr_info[VIDEO_TIMESTAMP_TOLERANCE_KEY] = 0.04
+    cfr_dataset = lerobot_dataset_factory(
+        root=tmp_path / "cfr",
+        repo_id="cfr",
+        info=cfr_info,
+    )
+
+    with (
+        patch("lerobot.datasets.lerobot_dataset.get_safe_version", return_value="v3.0"),
+        patch(
+            "lerobot.datasets.lerobot_dataset.snapshot_download",
+            return_value=str(tmp_path / "merged"),
+        ),
+    ):
+        merged = merge_datasets(
+            [vfr_dataset, cfr_dataset],
+            output_repo_id="merged",
+            output_dir=tmp_path / "merged",
+        )
+
+    assert vfr_dataset.video_timestamp_tolerance_s == pytest.approx(0.08)
+    assert cfr_dataset.video_timestamp_tolerance_s == pytest.approx(0.04)
+    assert merged.meta.info[VIDEO_TIMESTAMP_TOLERANCE_KEY] == pytest.approx(0.08)
+    assert merged.video_timestamp_tolerance_s == pytest.approx(0.08)
+    assert merged.tolerance_s == pytest.approx(1e-4)
 
 
 def test_add_features_with_values(sample_dataset, tmp_path):

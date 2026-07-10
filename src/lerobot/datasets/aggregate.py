@@ -39,7 +39,13 @@ from lerobot.datasets.utils import (
     write_stats,
     write_tasks,
 )
-from lerobot.datasets.video_utils import concatenate_video_files, get_video_duration_in_s
+from lerobot.datasets.video_utils import (
+    VIDEO_TIMESTAMP_TOLERANCE_KEY,
+    concatenate_video_files,
+    get_video_duration_in_s,
+    resolve_timestamp_tolerances,
+    validate_video_timestamp_tolerance,
+)
 
 
 def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
@@ -171,6 +177,7 @@ def aggregate_datasets(
     data_files_size_in_mb: float | None = None,
     video_files_size_in_mb: float | None = None,
     chunk_size: int | None = None,
+    video_timestamp_tolerance_s: float | None = None,
 ):
     """Aggregates multiple LeRobot datasets into a single unified dataset.
 
@@ -188,6 +195,7 @@ def aggregate_datasets(
         data_files_size_in_mb: Maximum size for data files in MB (defaults to DEFAULT_DATA_FILE_SIZE_IN_MB)
         video_files_size_in_mb: Maximum size for video files in MB (defaults to DEFAULT_VIDEO_FILE_SIZE_IN_MB)
         chunk_size: Maximum number of files per chunk (defaults to DEFAULT_CHUNK_SIZE)
+        video_timestamp_tolerance_s: Resolved video PTS tolerance supplied by a dataset-object caller.
     """
     logging.info("Start aggregate_datasets")
 
@@ -219,6 +227,23 @@ def aggregate_datasets(
         data_files_size_in_mb=data_files_size_in_mb,
         video_files_size_in_mb=video_files_size_in_mb,
     )
+    if video_keys:
+        dst_meta.info[VIDEO_TIMESTAMP_TOLERANCE_KEY] = (
+            validate_video_timestamp_tolerance(
+                video_timestamp_tolerance_s,
+                field_name=VIDEO_TIMESTAMP_TOLERANCE_KEY,
+            )
+            if video_timestamp_tolerance_s is not None
+            else max(
+                resolve_timestamp_tolerances(
+                    explicit_tolerance_s=None,
+                    metadata_tolerance=meta.info.get(VIDEO_TIMESTAMP_TOLERANCE_KEY),
+                    metadata_tolerance_present=VIDEO_TIMESTAMP_TOLERANCE_KEY in meta.info,
+                    fps=meta.fps,
+                )[1]
+                for meta in all_metadata
+            )
+        )
 
     logging.info("Find all tasks")
     unique_tasks = pd.concat([m.tasks for m in all_metadata]).index.unique()

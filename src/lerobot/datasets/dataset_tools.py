@@ -51,7 +51,16 @@ from lerobot.datasets.utils import (
     write_stats,
     write_tasks,
 )
+from lerobot.datasets.video_utils import VIDEO_TIMESTAMP_TOLERANCE_KEY
 from lerobot.utils.constants import HF_LEROBOT_HOME
+
+
+def _preserve_video_timestamp_tolerance(
+    src_dataset: LeRobotDataset,
+    dst_meta: LeRobotDatasetMetadata,
+) -> None:
+    if dst_meta.video_keys:
+        dst_meta.info[VIDEO_TIMESTAMP_TOLERANCE_KEY] = src_dataset.video_timestamp_tolerance_s
 
 
 def _load_episode_with_stats(src_dataset: LeRobotDataset, episode_idx: int) -> dict:
@@ -116,6 +125,7 @@ def delete_episodes(
         root=output_dir,
         use_videos=len(dataset.meta.video_keys) > 0,
     )
+    _preserve_video_timestamp_tolerance(dataset, new_meta)
 
     episode_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(episodes_to_keep)}
 
@@ -132,7 +142,6 @@ def delete_episodes(
         root=output_dir,
         image_transforms=dataset.image_transforms,
         delta_timestamps=dataset.delta_timestamps,
-        tolerance_s=dataset.tolerance_s,
     )
 
     logging.info(f"Created new dataset with {len(episodes_to_keep)} episodes")
@@ -208,6 +217,7 @@ def split_dataset(
             data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
             video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
         )
+        _preserve_video_timestamp_tolerance(dataset, new_meta)
 
         video_metadata = None
         if dataset.meta.video_keys:
@@ -222,7 +232,6 @@ def split_dataset(
             root=split_output_dir,
             image_transforms=dataset.image_transforms,
             delta_timestamps=dataset.delta_timestamps,
-            tolerance_s=dataset.tolerance_s,
         )
 
         result_datasets[split_name] = new_dataset
@@ -257,6 +266,11 @@ def merge_datasets(
         aggr_repo_id=output_repo_id,
         roots=roots,
         aggr_root=output_dir,
+        video_timestamp_tolerance_s=(
+            max(dataset.video_timestamp_tolerance_s for dataset in datasets)
+            if datasets[0].meta.video_keys
+            else None
+        ),
     )
 
     merged_dataset = LeRobotDataset(
@@ -264,7 +278,6 @@ def merge_datasets(
         root=output_dir,
         image_transforms=datasets[0].image_transforms,
         delta_timestamps=datasets[0].delta_timestamps,
-        tolerance_s=datasets[0].tolerance_s,
     )
 
     return merged_dataset
@@ -352,6 +365,7 @@ def modify_features(
         root=output_dir,
         use_videos=len(remaining_video_keys) > 0,
     )
+    _preserve_video_timestamp_tolerance(dataset, new_meta)
 
     _copy_data_with_feature_changes(
         dataset=dataset,
@@ -368,7 +382,6 @@ def modify_features(
         root=output_dir,
         image_transforms=dataset.image_transforms,
         delta_timestamps=dataset.delta_timestamps,
-        tolerance_s=dataset.tolerance_s,
     )
 
     return new_dataset

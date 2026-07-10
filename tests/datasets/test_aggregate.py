@@ -114,6 +114,11 @@ def assert_metadata_consistency(aggr_ds, ds_0, ds_1):
 
     # Test features are the same
     assert aggr_ds.features == ds_0.features == ds_1.features, "Features should be the same"
+    assert aggr_ds.video_timestamp_tolerance_s == max(
+        ds_0.video_timestamp_tolerance_s,
+        ds_1.video_timestamp_tolerance_s,
+    )
+    assert aggr_ds.tolerance_s == 1e-4
 
     # Test tasks aggregation
     expected_tasks = set(ds_0.meta.tasks.index) | set(ds_1.meta.tasks.index)

@@ -34,8 +34,10 @@ from lerobot.datasets.utils import (
     safe_shard,
 )
 from lerobot.datasets.video_utils import (
+    VIDEO_TIMESTAMP_TOLERANCE_KEY,
     VideoDecoderCache,
     decode_video_frames_torchcodec,
+    resolve_timestamp_tolerances,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME, LOOKAHEAD_BACKTRACKTABLE, LOOKBACK_BACKTRACKTABLE
 
@@ -85,7 +87,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         episodes: list[int] | None = None,
         image_transforms: Callable | None = None,
         delta_timestamps: dict[list[float]] | None = None,
-        tolerance_s: float = 1e-4,
+        tolerance_s: float | None = None,
         revision: str | None = None,
         force_cache_sync: bool = False,
         streaming: bool = True,
@@ -103,7 +105,10 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             episodes (list[int] | None, optional): If specified, this will only load episodes specified by
                 their episode_index in this list.
             image_transforms (Callable | None, optional): Transform to apply to image data.
-            tolerance_s (float, optional): Tolerance in seconds for timestamp matching.
+            tolerance_s (float | None, optional): Explicit tolerance for both delta timestamp validation and
+                video PTS matching. When omitted, delta timestamps retain the 1e-4 default, while video
+                matching reads `video_timestamp_tolerance_s` from `meta/info.json`. Older datasets without
+                that key use at most three frames, capped at 0.1 seconds.
             revision (str, optional): Git revision id (branch name, tag, or commit hash).
             force_cache_sync (bool, optional): Flag to sync and refresh local files first.
             streaming (bool, optional): Whether to stream the dataset or load it all. Defaults to True.
@@ -120,7 +125,6 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         self.image_transforms = image_transforms
         self.episodes = episodes
-        self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
         self.seed = seed
         self.rng = rng if rng is not None else np.random.default_rng(seed)
@@ -137,6 +141,12 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         # Load metadata
         self.meta = LeRobotDatasetMetadata(
             self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync
+        )
+        self.tolerance_s, self.video_timestamp_tolerance_s = resolve_timestamp_tolerances(
+            explicit_tolerance_s=tolerance_s,
+            metadata_tolerance=self.meta.info.get(VIDEO_TIMESTAMP_TOLERANCE_KEY),
+            metadata_tolerance_present=VIDEO_TIMESTAMP_TOLERANCE_KEY in self.meta.info,
+            fps=self.meta.fps,
         )
         # Check version
         check_version_compatibility(self.repo_id, self.meta._version, CODEBASE_VERSION)
@@ -308,13 +318,13 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         # Get episode index from the item
         ep_idx = item["episode_index"]
 
-        # "timestamp" restarts from 0 for each episode, whereas we need a global timestep within the single .mp4 file (given by index/fps)
-        current_ts = item["index"] / self.fps
+        current_ts = float(item["timestamp"])
 
         episode_boundaries_ts = {
             key: (
-                self.meta.episodes[ep_idx][f"videos/{key}/from_timestamp"],
-                self.meta.episodes[ep_idx][f"videos/{key}/to_timestamp"],
+                0.0,
+                self.meta.episodes[ep_idx][f"videos/{key}/to_timestamp"]
+                - self.meta.episodes[ep_idx][f"videos/{key}/from_timestamp"],
             )
             for key in self.meta.video_keys
         }
@@ -386,11 +396,17 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         """
 
         item = {}
+        ep = self.meta.episodes[ep_idx]
         for video_key, query_ts in query_timestamps.items():
             root = self.meta.url_root if self.streaming and not self.streaming_from_local else self.root
             video_path = f"{root}/{self.meta.get_video_file_path(ep_idx, video_key)}"
+            from_timestamp = ep[f"videos/{video_key}/from_timestamp"]
+            shifted_query_ts = [from_timestamp + timestamp for timestamp in query_ts]
             frames = decode_video_frames_torchcodec(
-                video_path, query_ts, self.tolerance_s, decoder_cache=self.video_decoder_cache
+                video_path,
+                shifted_query_ts,
+                self.video_timestamp_tolerance_s,
+                decoder_cache=self.video_decoder_cache,
             )
 
             item[video_key] = frames.squeeze(0) if len(query_ts) == 1 else frames

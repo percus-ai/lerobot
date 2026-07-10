@@ -109,6 +109,72 @@ def test_dataset_initialization(tmp_path, lerobot_dataset_factory):
     assert dataset.num_frames == len(dataset)
 
 
+@pytest.mark.parametrize(
+    (
+        "metadata_tolerance_s",
+        "explicit_tolerance_s",
+        "fps",
+        "expected_delta_tolerance_s",
+        "expected_video_tolerance_s",
+    ),
+    [
+        (None, None, 30, 1e-4, 0.1),
+        (None, None, 60, 1e-4, 0.05),
+        (0.05, None, 30, 1e-4, 0.05),
+        (0.1, 0.02, 30, 0.02, 0.02),
+    ],
+)
+def test_dataset_resolves_video_timestamp_tolerance(
+    tmp_path,
+    lerobot_dataset_factory,
+    info_factory,
+    metadata_tolerance_s,
+    explicit_tolerance_s,
+    fps,
+    expected_delta_tolerance_s,
+    expected_video_tolerance_s,
+):
+    info = info_factory(total_episodes=1, total_frames=1, total_tasks=1, fps=fps)
+    if metadata_tolerance_s is not None:
+        info["video_timestamp_tolerance_s"] = metadata_tolerance_s
+    kwargs = {} if explicit_tolerance_s is None else {"tolerance_s": explicit_tolerance_s}
+
+    dataset = lerobot_dataset_factory(root=tmp_path / "test", info=info, **kwargs)
+
+    assert dataset.tolerance_s == expected_delta_tolerance_s
+    assert dataset.video_timestamp_tolerance_s == expected_video_tolerance_s
+
+
+@pytest.mark.parametrize(
+    "invalid_tolerance_s",
+    [None, True, "0.1", 0, -0.1, float("nan"), float("inf")],
+)
+def test_dataset_rejects_invalid_metadata_video_timestamp_tolerance(
+    tmp_path,
+    lerobot_dataset_factory,
+    info_factory,
+    invalid_tolerance_s,
+):
+    info = info_factory(total_episodes=1, total_frames=1, total_tasks=1)
+    info["video_timestamp_tolerance_s"] = invalid_tolerance_s
+
+    with pytest.raises((TypeError, ValueError), match="finite positive number"):
+        lerobot_dataset_factory(root=tmp_path / "test", info=info)
+
+
+@pytest.mark.parametrize(
+    "invalid_tolerance_s",
+    [True, "0.1", 0, -0.1, float("nan"), float("inf")],
+)
+def test_dataset_rejects_invalid_explicit_video_timestamp_tolerance(
+    tmp_path,
+    lerobot_dataset_factory,
+    invalid_tolerance_s,
+):
+    with pytest.raises((TypeError, ValueError), match="finite positive number"):
+        lerobot_dataset_factory(root=tmp_path / "test", tolerance_s=invalid_tolerance_s)
+
+
 # TODO(rcadene, aliberts): do not run LeRobotDataset.create, instead refactor LeRobotDatasetMetadata.create
 # and test the small resulting function that validates the features
 def test_dataset_feature_with_forward_slash_raises_error():

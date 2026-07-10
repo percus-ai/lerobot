@@ -68,6 +68,7 @@ from lerobot.datasets.utils import (
     write_tasks,
 )
 from lerobot.datasets.video_utils import (
+    VIDEO_TIMESTAMP_TOLERANCE_KEY,
     VideoFrame,
     concatenate_video_files,
     decode_video_frames,
@@ -75,6 +76,8 @@ from lerobot.datasets.video_utils import (
     get_safe_default_codec,
     get_video_duration_in_s,
     get_video_info,
+    resolve_timestamp_tolerances,
+    validate_video_timestamp_tolerance,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
@@ -583,7 +586,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         episodes: list[int] | None = None,
         image_transforms: Callable | None = None,
         delta_timestamps: dict[str, list[float]] | None = None,
-        tolerance_s: float = 1e-4,
+        tolerance_s: float | None = None,
         revision: str | None = None,
         force_cache_sync: bool = False,
         download_videos: bool = True,
@@ -683,11 +686,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 torchvision.transforms.v2 here which will be applied to visual modalities (whether they come
                 from videos or images). Defaults to None.
             delta_timestamps (dict[list[float]] | None, optional): _description_. Defaults to None.
-            tolerance_s (float, optional): Tolerance in seconds used to ensure data timestamps are actually in
-                sync with the fps value. It is used at the init of the dataset to make sure that each
-                timestamps is separated to the next by 1/fps +/- tolerance_s. This also applies to frames
-                decoded from video files. It is also used to check that `delta_timestamps` (when provided) are
-                multiples of 1/fps. Defaults to 1e-4.
+            tolerance_s (float | None, optional): Explicit tolerance in seconds for both delta timestamp
+                validation and video PTS matching. When omitted, delta timestamps retain the 1e-4 default,
+                while video matching reads `video_timestamp_tolerance_s` from `meta/info.json`. Older datasets
+                without that key use at most three frames, capped at 0.1 seconds.
             revision (str, optional): An optional Git revision id which can be a branch name, a tag, or a
                 commit hash. Defaults to current codebase version tag.
             force_cache_sync (bool, optional): Flag to sync and refresh local files first. If True and files
@@ -708,7 +710,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.image_transforms = image_transforms
         self.delta_timestamps = delta_timestamps
         self.episodes = episodes
-        self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
         self.video_backend = video_backend if video_backend else get_safe_default_codec()
         self.delta_indices = None
@@ -727,6 +728,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Load metadata
         self.meta = LeRobotDatasetMetadata(
             self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync
+        )
+        self.tolerance_s, self.video_timestamp_tolerance_s = resolve_timestamp_tolerances(
+            explicit_tolerance_s=tolerance_s,
+            metadata_tolerance=self.meta.info.get(VIDEO_TIMESTAMP_TOLERANCE_KEY),
+            metadata_tolerance_present=VIDEO_TIMESTAMP_TOLERANCE_KEY in self.meta.info,
+            fps=self.meta.fps,
         )
 
         # Track dataset state for efficient incremental writing
@@ -1030,7 +1037,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
 
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
+            frames = decode_video_frames(
+                video_path,
+                shifted_query_ts,
+                self.video_timestamp_tolerance_s,
+                self.video_backend,
+            )
             item[vid_key] = frames.squeeze(0)
 
         return item
@@ -1582,7 +1594,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.repo_id = obj.meta.repo_id
         obj.root = obj.meta.root
         obj.revision = None
-        obj.tolerance_s = tolerance_s
+        obj.tolerance_s = validate_video_timestamp_tolerance(tolerance_s, field_name="tolerance_s")
+        obj.video_timestamp_tolerance_s = obj.tolerance_s
         obj.image_writer = None
         obj.batch_encoding_size = batch_encoding_size
         obj.episodes_since_last_encoding = 0
@@ -1631,7 +1644,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         super().__init__()
         self.repo_ids = repo_ids
         self.root = Path(root) if root else HF_LEROBOT_HOME
-        self.tolerances_s = tolerances_s if tolerances_s else dict.fromkeys(repo_ids, 0.0001)
+        self.tolerances_s = tolerances_s if tolerances_s is not None else dict.fromkeys(repo_ids)
         # Construct the underlying datasets passing everything but `transform` and `delta_timestamps` which
         # are handled by this class.
         self._datasets = [

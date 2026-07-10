@@ -13,14 +13,175 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
+import lerobot.datasets.streaming_dataset as streaming_dataset_module
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 from lerobot.datasets.utils import safe_shard
 from lerobot.utils.constants import ACTION
 from tests.fixtures.constants import DUMMY_REPO_ID
+
+
+@pytest.mark.parametrize(
+    (
+        "metadata_tolerance_s",
+        "explicit_tolerance_s",
+        "fps",
+        "expected_delta_tolerance_s",
+        "expected_video_tolerance_s",
+    ),
+    [
+        (None, None, 30, 1e-4, 0.1),
+        (None, None, 60, 1e-4, 0.05),
+        (0.05, None, 30, 1e-4, 0.05),
+        (0.1, 0.02, 30, 0.02, 0.02),
+    ],
+)
+def test_streaming_dataset_resolves_video_timestamp_tolerance(
+    tmp_path,
+    lerobot_dataset_factory,
+    info_factory,
+    metadata_tolerance_s,
+    explicit_tolerance_s,
+    fps,
+    expected_delta_tolerance_s,
+    expected_video_tolerance_s,
+):
+    root = tmp_path / "test"
+    info = info_factory(total_episodes=1, total_frames=1, total_tasks=1, fps=fps)
+    if metadata_tolerance_s is not None:
+        info["video_timestamp_tolerance_s"] = metadata_tolerance_s
+    lerobot_dataset_factory(root=root, info=info)
+    kwargs = {} if explicit_tolerance_s is None else {"tolerance_s": explicit_tolerance_s}
+
+    dataset = StreamingLeRobotDataset(repo_id=DUMMY_REPO_ID, root=root, **kwargs)
+
+    assert dataset.tolerance_s == expected_delta_tolerance_s
+    assert dataset.video_timestamp_tolerance_s == expected_video_tolerance_s
+
+
+@pytest.mark.parametrize(
+    "invalid_tolerance_s",
+    [None, True, "0.1", 0, -0.1, float("nan"), float("inf")],
+)
+def test_streaming_dataset_rejects_invalid_metadata_video_timestamp_tolerance(
+    tmp_path,
+    lerobot_dataset_factory,
+    invalid_tolerance_s,
+):
+    root = tmp_path / "test"
+    lerobot_dataset_factory(root=root)
+    info_path = root / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["video_timestamp_tolerance_s"] = invalid_tolerance_s
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+
+    with pytest.raises((TypeError, ValueError), match="finite positive number"):
+        StreamingLeRobotDataset(repo_id=DUMMY_REPO_ID, root=root)
+
+
+@pytest.mark.parametrize(
+    "invalid_tolerance_s",
+    [True, "0.1", 0, -0.1, float("nan"), float("inf")],
+)
+def test_streaming_dataset_rejects_invalid_explicit_video_timestamp_tolerance(
+    tmp_path,
+    lerobot_dataset_factory,
+    invalid_tolerance_s,
+):
+    root = tmp_path / "test"
+    lerobot_dataset_factory(root=root)
+
+    with pytest.raises((TypeError, ValueError), match="finite positive number"):
+        StreamingLeRobotDataset(
+            repo_id=DUMMY_REPO_ID,
+            root=root,
+            tolerance_s=invalid_tolerance_s,
+        )
+
+
+def test_streaming_video_query_adds_episode_video_offset(monkeypatch, tmp_path):
+    dataset = StreamingLeRobotDataset.__new__(StreamingLeRobotDataset)
+    dataset.root = tmp_path
+    dataset.streaming = False
+    dataset.streaming_from_local = True
+    dataset.video_timestamp_tolerance_s = 0.1
+    dataset.video_decoder_cache = object()
+    dataset.meta = type(
+        "Meta",
+        (),
+        {
+            "episodes": [{"videos/phone/from_timestamp": 12.5}],
+            "get_video_file_path": staticmethod(lambda _ep_idx, _video_key: "video.mp4"),
+        },
+    )()
+    captured = {}
+
+    def fake_decode(video_path, timestamps, tolerance_s, decoder_cache):
+        captured.update(
+            video_path=video_path,
+            timestamps=timestamps,
+            tolerance_s=tolerance_s,
+            decoder_cache=decoder_cache,
+        )
+        return torch.zeros((2, 3, 4, 4))
+
+    monkeypatch.setattr(streaming_dataset_module, "decode_video_frames_torchcodec", fake_decode)
+
+    frames = dataset._query_videos({"phone": [0.0, 1 / 30]}, ep_idx=0)
+
+    assert frames["phone"].shape == (2, 3, 4, 4)
+    assert captured == {
+        "video_path": f"{tmp_path}/video.mp4",
+        "timestamps": pytest.approx([12.5, 12.5 + 1 / 30]),
+        "tolerance_s": 0.1,
+        "decoder_cache": dataset.video_decoder_cache,
+    }
+
+
+def test_streaming_make_frame_queries_episode_relative_row_timestamp():
+    dataset = StreamingLeRobotDataset.__new__(StreamingLeRobotDataset)
+    dataset.delta_indices = None
+    dataset.delta_timestamps = None
+    dataset.image_transforms = None
+    dataset.meta = type(
+        "Meta",
+        (),
+        {
+            "fps": 30,
+            "video_keys": ["phone"],
+            "episodes": [
+                {
+                    "videos/phone/from_timestamp": 12.5,
+                    "videos/phone/to_timestamp": 13.5,
+                }
+            ],
+            "tasks": pd.DataFrame({"task_index": [0]}, index=["pick"]),
+        },
+    )()
+    captured = {}
+
+    def fake_query(query_timestamps, ep_idx):
+        captured.update(query_timestamps=query_timestamps, ep_idx=ep_idx)
+        return {"phone": torch.zeros((3, 4, 4))}
+
+    dataset._query_videos = fake_query
+    item = {
+        "episode_index": 0,
+        "timestamp": 0.25,
+        "index": 100,
+        "task_index": 0,
+    }
+
+    frame = next(dataset.make_frame(iter([item])))
+
+    assert captured == {"query_timestamps": {"phone": [0.25]}, "ep_idx": 0}
+    assert frame["task"] == "pick"
 
 
 def get_frames_expected_order(streaming_ds: StreamingLeRobotDataset) -> list[int]:

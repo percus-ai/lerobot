@@ -16,12 +16,16 @@
 import glob
 import importlib
 import logging
+import math
 import shutil
 import tempfile
 import warnings
+from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Lock
+from threading import Condition, Lock
 from typing import Any, ClassVar
 
 import av
@@ -31,6 +35,57 @@ import torch
 import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
+
+DEFAULT_DELTA_TIMESTAMP_TOLERANCE_S = 1e-4
+MAX_VIDEO_TIMESTAMP_TOLERANCE_S = 0.1
+VIDEO_TIMESTAMP_TOLERANCE_FRAMES = 3
+VIDEO_TIMESTAMP_TOLERANCE_KEY = "video_timestamp_tolerance_s"
+VIDEO_DECODER_CACHE_CAPACITY = 32
+
+
+def validate_video_timestamp_tolerance(
+    value: float | int | str | bool | None,
+    *,
+    field_name: str,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{field_name} must be a finite positive number")
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError(f"{field_name} must be a finite positive number")
+    return parsed
+
+
+def default_video_timestamp_tolerance(fps: float | int) -> float:
+    if isinstance(fps, bool) or not isinstance(fps, (int, float)):
+        raise TypeError("fps must be a finite positive number")
+    parsed_fps = float(fps)
+    if not math.isfinite(parsed_fps) or parsed_fps <= 0:
+        raise ValueError("fps must be a finite positive number")
+    return min(MAX_VIDEO_TIMESTAMP_TOLERANCE_S, VIDEO_TIMESTAMP_TOLERANCE_FRAMES / parsed_fps)
+
+
+def resolve_timestamp_tolerances(
+    *,
+    explicit_tolerance_s: float | int | None,
+    metadata_tolerance: float | int | str | bool | None,
+    metadata_tolerance_present: bool,
+    fps: float | int,
+) -> tuple[float, float]:
+    """Resolve delta-grid and video-PTS tolerances without weakening delta validation."""
+    if explicit_tolerance_s is not None:
+        tolerance_s = validate_video_timestamp_tolerance(explicit_tolerance_s, field_name="tolerance_s")
+        return tolerance_s, tolerance_s
+
+    video_tolerance_s = (
+        validate_video_timestamp_tolerance(
+            metadata_tolerance,
+            field_name=f"meta.info[{VIDEO_TIMESTAMP_TOLERANCE_KEY!r}]",
+        )
+        if metadata_tolerance_present
+        else default_video_timestamp_tolerance(fps)
+    )
+    return DEFAULT_DELTA_TIMESTAMP_TOLERANCE_S, video_tolerance_s
 
 
 def get_safe_default_codec():
@@ -63,6 +118,7 @@ def decode_video_frames(
 
     Currently supports torchcodec on cpu and pyav.
     """
+    tolerance_s = validate_video_timestamp_tolerance(tolerance_s, field_name="tolerance_s")
     if backend is None:
         backend = get_safe_default_codec()
     if backend == "torchcodec":
@@ -99,6 +155,7 @@ def decode_video_frames_torchvision(
     and all subsequent frames until reaching the requested frame. The number of key frames in a video
     can be adjusted during encoding to take into account decoding time and video size in bytes.
     """
+    tolerance_s = validate_video_timestamp_tolerance(tolerance_s, field_name="tolerance_s")
     video_path = str(video_path)
 
     # set backend
@@ -145,17 +202,19 @@ def decode_video_frames_torchvision(
     dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
     min_, argmin_ = dist.min(1)
 
-    is_within_tol = min_ < tolerance_s
-    assert is_within_tol.all(), (
-        f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
-        "It means that the closest frame that can be loaded from the video is too far away in time."
-        "This might be due to synchronization issues with timestamps during data collection."
-        "To be safe, we advise to ignore this item during training."
-        f"\nqueried timestamps: {query_ts}"
-        f"\nloaded timestamps: {loaded_ts}"
-        f"\nvideo: {video_path}"
-        f"\nbackend: {backend}"
-    )
+    is_within_tol = min_ <= tolerance_s
+    if not is_within_tol.all():
+        raise FrameTimestampError(
+            f"One or several query timestamps unexpectedly violate the tolerance "
+            f"({min_[~is_within_tol]} > {tolerance_s=})."
+            "It means that the closest frame that can be loaded from the video is too far away in time."
+            "This might be due to synchronization issues with timestamps during data collection."
+            "To be safe, we advise to ignore this item during training."
+            f"\nqueried timestamps: {query_ts}"
+            f"\nloaded timestamps: {loaded_ts}"
+            f"\nvideo: {video_path}"
+            f"\nbackend: {backend}"
+        )
 
     # get closest frames to the query timestamps
     closest_frames = torch.stack([loaded_frames[idx] for idx in argmin_])
@@ -174,37 +233,95 @@ def decode_video_frames_torchvision(
 class VideoDecoderCache:
     """Thread-safe cache for video decoders to avoid expensive re-initialization."""
 
-    def __init__(self):
-        self._cache: dict[str, tuple[Any, Any]] = {}
-        self._lock = Lock()
+    def __init__(self, capacity: int = VIDEO_DECODER_CACHE_CAPACITY):
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+            raise ValueError("Video decoder cache capacity must be a positive integer")
+        self.capacity = capacity
+        self._cache: OrderedDict[str, tuple[Any, Any, float]] = OrderedDict()
+        self._entry_locks: dict[str, Lock] = {}
+        self._lease_counts: dict[str, int] = {}
+        self._condition = Condition()
 
-    def get_decoder(self, video_path: str):
-        """Get a cached decoder or create a new one."""
+    def _evict_one_locked(self) -> bool:
+        for cached_path in tuple(self._cache):
+            if self._lease_counts[cached_path] != 0:
+                continue
+            _, evicted_file_handle, _ = self._cache.pop(cached_path)
+            self._entry_locks.pop(cached_path)
+            self._lease_counts.pop(cached_path)
+            evicted_file_handle.close()
+            return True
+        return False
+
+    def _get_or_create_locked(self, video_path: str) -> tuple[Any, Any, float]:
         if importlib.util.find_spec("torchcodec"):
             from torchcodec.decoders import VideoDecoder
         else:
             raise ImportError("torchcodec is required but not available.")
 
         video_path = str(video_path)
+        while True:
+            cached = self._cache.get(video_path)
+            if cached is not None:
+                self._cache.move_to_end(video_path)
+                return cached
+            if len(self._cache) < self.capacity:
+                break
+            if self._evict_one_locked():
+                break
+            self._condition.wait()
 
-        with self._lock:
-            if video_path not in self._cache:
-                file_handle = fsspec.open(video_path).__enter__()
-                decoder = VideoDecoder(file_handle, seek_mode="approximate")
-                self._cache[video_path] = (decoder, file_handle)
+        file_handle = fsspec.open(video_path).__enter__()
+        try:
+            decoder = VideoDecoder(file_handle, seek_mode="exact")
+            frame_count = len(decoder)
+            if frame_count <= 0:
+                raise ValueError(f"Video has no frames: {video_path}")
+            last_frame = decoder.get_frames_at(indices=[frame_count - 1])
+            last_frame_pts = float(last_frame.pts_seconds[0].item())
+        except Exception:
+            file_handle.close()
+            raise
 
-            return self._cache[video_path][0]
+        cached = (decoder, file_handle, last_frame_pts)
+        self._cache[video_path] = cached
+        self._entry_locks[video_path] = Lock()
+        self._lease_counts[video_path] = 0
+        return cached
+
+    @contextmanager
+    def lease(self, video_path: str) -> Iterator[tuple[Any, float]]:
+        """Keep a decoder alive for the full decode operation."""
+        video_path = str(video_path)
+        with self._condition:
+            decoder, _, last_frame_pts = self._get_or_create_locked(video_path)
+            entry_lock = self._entry_locks[video_path]
+            self._lease_counts[video_path] += 1
+
+        entry_lock.acquire()
+        try:
+            yield decoder, last_frame_pts
+        finally:
+            entry_lock.release()
+            with self._condition:
+                self._lease_counts[video_path] -= 1
+                self._condition.notify_all()
 
     def clear(self):
         """Clear the cache and close file handles."""
-        with self._lock:
-            for _, file_handle in self._cache.values():
+        with self._condition:
+            if any(self._lease_counts.values()):
+                raise RuntimeError("Cannot clear video decoder cache while decoders are leased")
+            for _, file_handle, _ in self._cache.values():
                 file_handle.close()
             self._cache.clear()
+            self._entry_locks.clear()
+            self._lease_counts.clear()
+            self._condition.notify_all()
 
     def size(self) -> int:
         """Return the number of cached decoders."""
-        with self._lock:
+        with self._condition:
             return len(self._cache)
 
 
@@ -241,50 +358,84 @@ def decode_video_frames_torchcodec(
     and all subsequent frames until reaching the requested frame. The number of key frames in a video
     can be adjusted during encoding to take into account decoding time and video size in bytes.
     """
+    tolerance_s = validate_video_timestamp_tolerance(tolerance_s, field_name="tolerance_s")
     if decoder_cache is None:
         decoder_cache = _default_decoder_cache
 
-    # Use cached decoder instead of creating new one each time
-    decoder = decoder_cache.get_decoder(str(video_path))
+    video_path = str(video_path)
+    with decoder_cache.lease(video_path) as (decoder, last_frame_pts):
+        metadata = decoder.metadata
+        begin_stream_s = metadata.begin_stream_seconds
+        end_stream_s = metadata.end_stream_seconds
+        if begin_stream_s is None or end_stream_s is None:
+            raise ValueError(f"Video stream timestamps are unavailable for {video_path}")
 
-    loaded_ts = []
-    loaded_frames = []
+        bounded_timestamps = [min(max(timestamp, begin_stream_s), last_frame_pts) for timestamp in timestamps]
+        previous_frames = decoder.get_frames_played_at(seconds=bounded_timestamps)
 
-    # get metadata for frame information
-    metadata = decoder.metadata
-    average_fps = metadata.average_fps
-    # convert timestamps to frame indices
-    frame_indices = [round(ts * average_fps) for ts in timestamps]
-    # retrieve frames based on indices
-    frames_batch = decoder.get_frames_at(indices=frame_indices)
+        previous_pts = previous_frames.pts_seconds.cpu()
+        query_ts = torch.tensor(timestamps, dtype=previous_frames.pts_seconds.dtype)
+        estimated_successor_pts = previous_pts + previous_frames.duration_seconds.cpu()
+        previous_dist = (query_ts - previous_pts).abs()
+        successor_indices = [
+            index
+            for index, pts in enumerate(previous_pts)
+            if pts.item() < last_frame_pts
+            and (query_ts[index] - estimated_successor_pts[index]).abs().item() < previous_dist[index].item()
+        ]
+        successor_timestamps = [
+            min(
+                math.nextafter(
+                    (previous_pts[index] + previous_frames.duration_seconds[index].cpu()).item(),
+                    math.inf,
+                ),
+                last_frame_pts,
+            )
+            for index in successor_indices
+        ]
 
-    for frame, pts in zip(frames_batch.data, frames_batch.pts_seconds, strict=True):
-        loaded_frames.append(frame)
-        loaded_ts.append(pts.item())
-        if log_loaded_timestamps:
-            logging.info(f"Frame loaded at timestamp={pts:.4f}")
+        next_pts = previous_pts.clone()
+        successor_data: dict[int, torch.Tensor] = {}
+        if successor_timestamps:
+            successor_frames = decoder.get_frames_played_at(seconds=successor_timestamps)
+            for source_index, successor_frame, successor_pts in zip(
+                successor_indices,
+                successor_frames.data,
+                successor_frames.pts_seconds.cpu(),
+                strict=True,
+            ):
+                if successor_pts <= previous_pts[source_index]:
+                    raise FrameTimestampError(
+                        "TorchCodec exact timestamp seek did not advance to the successor frame "
+                        f"for {video_path}: previous={previous_pts[source_index].item()} "
+                        f"successor={successor_pts.item()}"
+                    )
+                next_pts[source_index] = successor_pts
+                successor_data[source_index] = successor_frame
 
-    query_ts = torch.tensor(timestamps)
-    loaded_ts = torch.tensor(loaded_ts)
+    next_dist = (query_ts - next_pts).abs()
+    use_next = next_dist < previous_dist
+    min_ = torch.minimum(previous_dist, next_dist)
 
-    # compute distances between each query timestamp and loaded timestamps
-    dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
-    min_, argmin_ = dist.min(1)
+    is_within_tol = min_ <= tolerance_s
+    if not is_within_tol.all():
+        raise FrameTimestampError(
+            f"One or several query timestamps unexpectedly violate the tolerance "
+            f"({min_[~is_within_tol]} > {tolerance_s=})."
+            "It means that the closest frame that can be loaded from the video is too far away in time."
+            "This might be due to synchronization issues with timestamps during data collection."
+            "To be safe, we advise to ignore this item during training."
+            f"\nqueried timestamps: {query_ts}"
+            f"\nprevious timestamps: {previous_pts}"
+            f"\nnext timestamps: {next_pts}"
+            f"\nvideo: {video_path}"
+        )
 
-    is_within_tol = min_ < tolerance_s
-    assert is_within_tol.all(), (
-        f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
-        "It means that the closest frame that can be loaded from the video is too far away in time."
-        "This might be due to synchronization issues with timestamps during data collection."
-        "To be safe, we advise to ignore this item during training."
-        f"\nqueried timestamps: {query_ts}"
-        f"\nloaded timestamps: {loaded_ts}"
-        f"\nvideo: {video_path}"
-    )
-
-    # get closest frames to the query timestamps
-    closest_frames = torch.stack([loaded_frames[idx] for idx in argmin_])
-    closest_ts = loaded_ts[argmin_]
+    closest_frames = previous_frames.data.clone()
+    for index, frame in successor_data.items():
+        if use_next[index]:
+            closest_frames[index] = frame
+    closest_ts = torch.where(use_next, next_pts, previous_pts)
 
     if log_loaded_timestamps:
         logging.info(f"{closest_ts=}")
