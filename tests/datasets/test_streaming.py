@@ -149,6 +149,7 @@ def test_streaming_make_frame_queries_episode_relative_row_timestamp():
     dataset.delta_indices = None
     dataset.delta_timestamps = None
     dataset.image_transforms = None
+    dataset.video_query_uses_frame_index = True
     dataset.meta = type(
         "Meta",
         (),
@@ -173,15 +174,76 @@ def test_streaming_make_frame_queries_episode_relative_row_timestamp():
     dataset._query_videos = fake_query
     item = {
         "episode_index": 0,
-        "timestamp": 0.25,
+        "timestamp": float(np.float32(108_001 / 30)),
+        "frame_index": 108_001,
         "index": 100,
         "task_index": 0,
     }
 
     frame = next(dataset.make_frame(iter([item])))
 
-    assert captured == {"query_timestamps": {"phone": [0.25]}, "ep_idx": 0}
+    assert captured == {
+        "query_timestamps": {"phone": [108_001 / 30]},
+        "ep_idx": 0,
+    }
     assert frame["task"] == "pick"
+
+
+def test_streaming_delta_video_query_preserves_long_timeline_precision() -> None:
+    dataset = StreamingLeRobotDataset.__new__(StreamingLeRobotDataset)
+    dataset.delta_timestamps = {"phone": [0.0]}
+    dataset.video_query_uses_frame_index = True
+    dataset.meta = type("Meta", (), {"fps": 30, "video_keys": ["phone"]})()
+    current_timestamp_s = 108_001 / 30
+
+    query = dataset._get_query_timestamps(
+        current_timestamp_s,
+        {"phone": [0]},
+        {"phone": (0.0, 4_000.0)},
+    )
+
+    assert query == {"phone": [current_timestamp_s]}
+
+
+def test_streaming_legacy_dataset_uses_persisted_row_timestamp() -> None:
+    dataset = StreamingLeRobotDataset.__new__(StreamingLeRobotDataset)
+    dataset.delta_indices = None
+    dataset.delta_timestamps = None
+    dataset.image_transforms = None
+    dataset.video_query_uses_frame_index = False
+    dataset.meta = type(
+        "Meta",
+        (),
+        {
+            "fps": 30,
+            "video_keys": ["phone"],
+            "episodes": [
+                {
+                    "videos/phone/from_timestamp": 0.0,
+                    "videos/phone/to_timestamp": 1.0,
+                }
+            ],
+            "tasks": pd.DataFrame({"task_index": [0]}, index=["pick"]),
+        },
+    )()
+    captured = {}
+
+    def fake_query(query_timestamps, ep_idx):
+        captured.update(query_timestamps=query_timestamps, ep_idx=ep_idx)
+        return {"phone": torch.zeros((3, 4, 4))}
+
+    dataset._query_videos = fake_query
+    item = {
+        "episode_index": 0,
+        "timestamp": 0.125,
+        "frame_index": 30,
+        "index": 30,
+        "task_index": 0,
+    }
+
+    next(dataset.make_frame(iter([item])))
+
+    assert captured == {"query_timestamps": {"phone": [0.125]}, "ep_idx": 0}
 
 
 def get_frames_expected_order(streaming_ds: StreamingLeRobotDataset) -> list[int]:

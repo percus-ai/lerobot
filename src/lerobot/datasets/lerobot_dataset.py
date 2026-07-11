@@ -68,6 +68,7 @@ from lerobot.datasets.utils import (
     write_tasks,
 )
 from lerobot.datasets.video_utils import (
+    VIDEO_QUERY_TIMESTAMP_SOURCE_KEY,
     VIDEO_TIMESTAMP_TOLERANCE_KEY,
     VideoFrame,
     concatenate_video_files,
@@ -77,6 +78,7 @@ from lerobot.datasets.video_utils import (
     get_video_duration_in_s,
     get_video_info,
     resolve_timestamp_tolerances,
+    resolve_video_query_timestamp_source,
     validate_video_timestamp_tolerance,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME
@@ -735,6 +737,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
             metadata_tolerance_present=VIDEO_TIMESTAMP_TOLERANCE_KEY in self.meta.info,
             fps=self.meta.fps,
         )
+        self.video_query_uses_frame_index = resolve_video_query_timestamp_source(
+            metadata_value=self.meta.info.get(VIDEO_QUERY_TIMESTAMP_SOURCE_KEY),
+            metadata_value_present=VIDEO_QUERY_TIMESTAMP_SOURCE_KEY in self.meta.info,
+        )
 
         # Track dataset state for efficient incremental writing
         self._lazy_loading = False
@@ -977,6 +983,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
     def _get_query_timestamps(
         self,
         current_ts: float,
+        current_frame_index: int,
         query_indices: dict[str, list[int]] | None = None,
     ) -> dict[str, list[float]]:
         query_timestamps = {}
@@ -984,12 +991,20 @@ class LeRobotDataset(torch.utils.data.Dataset):
             if query_indices is not None and key in query_indices:
                 if self._absolute_to_relative_idx is not None:
                     relative_indices = [self._absolute_to_relative_idx[idx] for idx in query_indices[key]]
-                    timestamps = self.hf_dataset[relative_indices]["timestamp"]
                 else:
-                    timestamps = self.hf_dataset[query_indices[key]]["timestamp"]
-                query_timestamps[key] = torch.stack(timestamps).tolist()
+                    relative_indices = query_indices[key]
+                if self.video_query_uses_frame_index:
+                    frame_indices = self.hf_dataset[relative_indices]["frame_index"]
+                    query_timestamps[key] = (
+                        torch.stack(frame_indices).to(torch.float64).div(self.fps).tolist()
+                    )
+                else:
+                    timestamps = self.hf_dataset[relative_indices]["timestamp"]
+                    query_timestamps[key] = torch.stack(timestamps).tolist()
             else:
-                query_timestamps[key] = [current_ts]
+                query_timestamps[key] = [
+                    current_frame_index / self.fps if self.video_query_uses_frame_index else current_ts
+                ]
 
         return query_timestamps
 
@@ -1068,15 +1083,21 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         query_indices = None
         if self.delta_indices is not None:
-            query_indices, padding = self._get_query_indices(idx, ep_idx)
+            absolute_idx = int(item["index"].item())
+            query_indices, padding = self._get_query_indices(absolute_idx, ep_idx)
             query_result = self._query_hf_dataset(query_indices)
             item = {**item, **padding}
             for key, val in query_result.items():
                 item[key] = val
 
         if len(self.meta.video_keys) > 0:
-            current_ts = item["timestamp"].item()
-            query_timestamps = self._get_query_timestamps(current_ts, query_indices)
+            current_ts = float(item["timestamp"].item())
+            current_frame_index = int(item["frame_index"].item())
+            query_timestamps = self._get_query_timestamps(
+                current_ts,
+                current_frame_index,
+                query_indices,
+            )
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
 
@@ -1596,6 +1617,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.revision = None
         obj.tolerance_s = validate_video_timestamp_tolerance(tolerance_s, field_name="tolerance_s")
         obj.video_timestamp_tolerance_s = obj.tolerance_s
+        obj.video_query_uses_frame_index = False
         obj.image_writer = None
         obj.batch_encoding_size = batch_encoding_size
         obj.episodes_since_last_encoding = 0

@@ -20,6 +20,10 @@ import torch
 
 from lerobot.datasets.aggregate import aggregate_datasets
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.video_utils import (
+    VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX,
+    VIDEO_QUERY_TIMESTAMP_SOURCE_KEY,
+)
 from tests.fixtures.constants import DUMMY_REPO_ID
 
 
@@ -221,7 +225,7 @@ def assert_video_timestamps_within_bounds(aggr_ds):
             )
 
 
-def test_aggregate_datasets(tmp_path, lerobot_dataset_factory):
+def test_aggregate_datasets(tmp_path, info_factory, lerobot_dataset_factory):
     """Test basic aggregation functionality with standard parameters."""
     ds_0_num_frames = 400
     ds_1_num_frames = 800
@@ -229,17 +233,27 @@ def test_aggregate_datasets(tmp_path, lerobot_dataset_factory):
     ds_1_num_episodes = 25
 
     # Create two datasets with different number of frames and episodes
+    ds_0_info = info_factory(
+        total_episodes=ds_0_num_episodes,
+        total_frames=ds_0_num_frames,
+        total_tasks=1,
+    )
+    ds_0_info[VIDEO_QUERY_TIMESTAMP_SOURCE_KEY] = VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX
     ds_0 = lerobot_dataset_factory(
         root=tmp_path / "test_0",
         repo_id=f"{DUMMY_REPO_ID}_0",
-        total_episodes=ds_0_num_episodes,
-        total_frames=ds_0_num_frames,
+        info=ds_0_info,
     )
+    ds_1_info = info_factory(
+        total_episodes=ds_1_num_episodes,
+        total_frames=ds_1_num_frames,
+        total_tasks=1,
+    )
+    ds_1_info[VIDEO_QUERY_TIMESTAMP_SOURCE_KEY] = VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX
     ds_1 = lerobot_dataset_factory(
         root=tmp_path / "test_1",
         repo_id=f"{DUMMY_REPO_ID}_1",
-        total_episodes=ds_1_num_episodes,
-        total_frames=ds_1_num_frames,
+        info=ds_1_info,
     )
 
     aggregate_datasets(
@@ -268,6 +282,7 @@ def test_aggregate_datasets(tmp_path, lerobot_dataset_factory):
     assert_episode_indices_updated_correctly(aggr_ds, ds_0, ds_1)
     assert_video_frames_integrity(aggr_ds, ds_0, ds_1)
     assert_video_timestamps_within_bounds(aggr_ds)
+    assert aggr_ds.meta.info[VIDEO_QUERY_TIMESTAMP_SOURCE_KEY] == VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX
 
 
 def test_aggregate_video_rotation_offsets(tmp_path, lerobot_dataset_factory):

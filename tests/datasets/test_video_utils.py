@@ -14,10 +14,12 @@ import torch
 
 import lerobot.datasets.video_utils as video_utils_module
 from lerobot.datasets.video_utils import (
+    VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX,
     FrameTimestampError,
     VideoDecoderCache,
     decode_video_frames_torchcodec,
     decode_video_frames_torchvision,
+    resolve_video_query_timestamp_source,
 )
 
 
@@ -35,17 +37,22 @@ class _Metadata:
 
 
 class _Decoder:
-    def __init__(self, pts_seconds: list[float], last_duration_s: float = 0.1) -> None:
-        self.pts_seconds = torch.tensor(pts_seconds, dtype=torch.float64)
+    def __init__(
+        self,
+        pts_seconds: list[float],
+        last_duration_s: float = 0.1,
+        dtype: torch.dtype = torch.float64,
+    ) -> None:
+        self.pts_seconds = torch.tensor(pts_seconds, dtype=dtype)
         self.duration_seconds = torch.tensor(
             [
                 *(pts_seconds[index + 1] - pts_seconds[index] for index in range(len(pts_seconds) - 1)),
                 last_duration_s,
             ],
-            dtype=torch.float64,
+            dtype=dtype,
         )
         self.data = (
-            torch.tensor(pts_seconds, dtype=torch.float64).mul(100).to(torch.uint8)[:, None, None, None]
+            torch.tensor(pts_seconds, dtype=dtype).mul(100).to(torch.uint8)[:, None, None, None]
         )
         self.metadata = _Metadata(pts_seconds[0], pts_seconds[-1] + last_duration_s)
         self.timestamp_queries: list[list[float]] = []
@@ -56,7 +63,7 @@ class _Decoder:
         self.timestamp_queries.append(seconds)
         indices = torch.searchsorted(
             self.pts_seconds,
-            torch.tensor(seconds, dtype=torch.float64),
+            torch.tensor(seconds, dtype=self.pts_seconds.dtype),
             right=True,
         ).sub(1)
         indices.clamp_(0, len(self.pts_seconds) - 1)
@@ -90,6 +97,34 @@ def _decode(decoder: _Decoder, timestamps: list[float], tolerance_s: float) -> t
 
 def _decoded_values(frames: torch.Tensor) -> list[int]:
     return frames[:, 0, 0, 0].mul(255).round().to(torch.int).tolist()
+
+
+def test_video_query_timestamp_source_defaults_to_persisted_timestamp() -> None:
+    assert (
+        resolve_video_query_timestamp_source(
+            metadata_value=None,
+            metadata_value_present=False,
+        )
+        is False
+    )
+
+
+def test_video_query_timestamp_source_accepts_exact_frame_index_contract() -> None:
+    assert (
+        resolve_video_query_timestamp_source(
+            metadata_value=VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX,
+            metadata_value_present=True,
+        )
+        is True
+    )
+
+
+def test_video_query_timestamp_source_rejects_unknown_contract() -> None:
+    with pytest.raises(ValueError, match="video_query_timestamp_source"):
+        resolve_video_query_timestamp_source(
+            metadata_value="unknown",
+            metadata_value_present=True,
+        )
 
 
 def test_torchcodec_uses_pts_nearest_for_cfr_video() -> None:
@@ -163,6 +198,13 @@ def test_torchcodec_rejects_nearest_pts_outside_tolerance() -> None:
 
     with pytest.raises(FrameTimestampError, match="violate the tolerance"):
         _decode(decoder, [0.15], tolerance_s=0.1)
+
+
+def test_torchcodec_rejects_float32_pts_for_long_vfr_timeline() -> None:
+    decoder = _Decoder([3600.03328, 3600.03338], dtype=torch.float32)
+
+    with pytest.raises(FrameTimestampError, match="float64 PTS"):
+        _decode(decoder, [108_001 / 30], tolerance_s=0.001)
 
 
 class _FakeFileHandle:
@@ -373,6 +415,19 @@ class _Reader:
         pass
 
 
+class _LongTimelineReader(_Reader):
+    def __iter__(self):
+        center = 108_001 / 30
+        yield {
+            "pts": center - 0.00005,
+            "data": torch.zeros((3, 2, 2), dtype=torch.uint8),
+        }
+        yield {
+            "pts": center + 0.00005,
+            "data": torch.full((3, 2, 2), 200, dtype=torch.uint8),
+        }
+
+
 def test_pyav_uses_the_same_inclusive_tolerance_contract(monkeypatch) -> None:
     monkeypatch.setattr(video_utils_module.torchvision, "set_video_backend", lambda _backend: None)
     monkeypatch.setattr(video_utils_module.torchvision.io, "VideoReader", lambda *_args: _Reader())
@@ -382,6 +437,25 @@ def test_pyav_uses_the_same_inclusive_tolerance_contract(monkeypatch) -> None:
     assert frame.shape == (1, 3, 2, 2)
     with pytest.raises(FrameTimestampError, match="violate the tolerance"):
         decode_video_frames_torchvision("video.mp4", [0.1], tolerance_s=0.09)
+
+
+def test_pyav_preserves_float64_query_precision_on_long_vfr_timeline(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(video_utils_module.torchvision, "set_video_backend", lambda _backend: None)
+    monkeypatch.setattr(
+        video_utils_module.torchvision.io,
+        "VideoReader",
+        lambda *_args: _LongTimelineReader(),
+    )
+
+    frame = decode_video_frames_torchvision(
+        "video.mp4",
+        [108_001 / 30],
+        tolerance_s=0.001,
+    )
+
+    assert torch.count_nonzero(frame) == 0
 
 
 def _write_cfr_video(path: Path) -> None:

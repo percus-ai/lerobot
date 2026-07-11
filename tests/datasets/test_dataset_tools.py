@@ -29,7 +29,11 @@ from lerobot.datasets.dataset_tools import (
     remove_feature,
     split_dataset,
 )
-from lerobot.datasets.video_utils import VIDEO_TIMESTAMP_TOLERANCE_KEY
+from lerobot.datasets.video_utils import (
+    VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX,
+    VIDEO_QUERY_TIMESTAMP_SOURCE_KEY,
+    VIDEO_TIMESTAMP_TOLERANCE_KEY,
+)
 from lerobot.scripts.lerobot_edit_dataset import convert_dataset_to_videos
 
 
@@ -295,13 +299,14 @@ def test_merge_empty_list(tmp_path):
         merge_datasets([], output_repo_id="merged", output_dir=tmp_path)
 
 
-def test_dataset_tools_preserve_video_timestamp_tolerance(
+def test_dataset_tools_preserve_video_read_contract(
     tmp_path,
     info_factory,
     lerobot_dataset_factory,
 ):
     info = info_factory(total_episodes=3, total_frames=30, total_tasks=1)
     info[VIDEO_TIMESTAMP_TOLERANCE_KEY] = 0.07
+    info[VIDEO_QUERY_TIMESTAMP_SOURCE_KEY] = VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX
     source = lerobot_dataset_factory(
         root=tmp_path / "source",
         repo_id="source",
@@ -325,7 +330,9 @@ def test_dataset_tools_preserve_video_timestamp_tolerance(
 
     for dataset in [filtered, *splits.values(), modified]:
         assert dataset.meta.info[VIDEO_TIMESTAMP_TOLERANCE_KEY] == pytest.approx(0.07)
+        assert dataset.meta.info[VIDEO_QUERY_TIMESTAMP_SOURCE_KEY] == VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX
         assert dataset.video_timestamp_tolerance_s == pytest.approx(0.07)
+        assert dataset.video_query_uses_frame_index is True
         assert dataset.tolerance_s == pytest.approx(1e-4)
 
 
@@ -336,6 +343,7 @@ def test_merge_uses_maximum_resolved_video_timestamp_tolerance(
 ):
     vfr_info = info_factory(total_episodes=1, total_frames=10, total_tasks=1)
     vfr_info[VIDEO_TIMESTAMP_TOLERANCE_KEY] = 0.05
+    vfr_info[VIDEO_QUERY_TIMESTAMP_SOURCE_KEY] = VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX
     vfr_dataset = lerobot_dataset_factory(
         root=tmp_path / "vfr",
         repo_id="vfr",
@@ -344,6 +352,7 @@ def test_merge_uses_maximum_resolved_video_timestamp_tolerance(
     )
     cfr_info = info_factory(total_episodes=1, total_frames=10, total_tasks=1)
     cfr_info[VIDEO_TIMESTAMP_TOLERANCE_KEY] = 0.04
+    cfr_info[VIDEO_QUERY_TIMESTAMP_SOURCE_KEY] = VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX
     cfr_dataset = lerobot_dataset_factory(
         root=tmp_path / "cfr",
         repo_id="cfr",
@@ -366,8 +375,38 @@ def test_merge_uses_maximum_resolved_video_timestamp_tolerance(
     assert vfr_dataset.video_timestamp_tolerance_s == pytest.approx(0.08)
     assert cfr_dataset.video_timestamp_tolerance_s == pytest.approx(0.04)
     assert merged.meta.info[VIDEO_TIMESTAMP_TOLERANCE_KEY] == pytest.approx(0.08)
+    assert merged.meta.info[VIDEO_QUERY_TIMESTAMP_SOURCE_KEY] == VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX
     assert merged.video_timestamp_tolerance_s == pytest.approx(0.08)
+    assert merged.video_query_uses_frame_index is True
     assert merged.tolerance_s == pytest.approx(1e-4)
+
+
+def test_merge_rejects_mixed_video_query_timestamp_sources(
+    tmp_path,
+    info_factory,
+    lerobot_dataset_factory,
+):
+    frame_index_info = info_factory(total_episodes=1, total_frames=1, total_tasks=1)
+    frame_index_info[VIDEO_QUERY_TIMESTAMP_SOURCE_KEY] = VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX
+    frame_index_dataset = lerobot_dataset_factory(
+        root=tmp_path / "frame-index",
+        repo_id="frame-index",
+        info=frame_index_info,
+    )
+    legacy_dataset = lerobot_dataset_factory(
+        root=tmp_path / "legacy",
+        repo_id="legacy",
+        total_episodes=1,
+        total_frames=1,
+        total_tasks=1,
+    )
+
+    with pytest.raises(ValueError, match="mixed video query timestamp sources"):
+        merge_datasets(
+            [frame_index_dataset, legacy_dataset],
+            output_repo_id="mixed",
+            output_dir=tmp_path / "mixed",
+        )
 
 
 def test_add_features_with_values(sample_dataset, tmp_path):

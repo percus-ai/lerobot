@@ -177,6 +177,22 @@ def visualize_dataset(
             print("Ctrl-C received. Exiting.")
 
 
+def load_dataset_for_visualization(
+    repo_id: str,
+    episode_index: int,
+    root: Path | None,
+    tolerance_s: float | None,
+) -> LeRobotDataset:
+    if tolerance_s is None:
+        return LeRobotDataset(repo_id, episodes=[episode_index], root=root)
+    return LeRobotDataset(
+        repo_id,
+        episodes=[episode_index],
+        root=root,
+        tolerance_s=tolerance_s,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -253,11 +269,10 @@ def main():
     parser.add_argument(
         "--tolerance-s",
         type=float,
-        default=1e-4,
+        default=None,
         help=(
-            "Tolerance in seconds used to ensure data timestamps respect the dataset fps value"
-            "This is argument passed to the constructor of LeRobotDataset and maps to its tolerance_s constructor argument"
-            "If not given, defaults to 1e-4."
+            "Explicit timestamp tolerance in seconds. When omitted, video decoding uses the dataset metadata "
+            "value and older datasets use the LeRobot default."
         ),
     )
 
@@ -268,7 +283,12 @@ def main():
     tolerance_s = kwargs.pop("tolerance_s")
 
     logging.info("Loading dataset")
-    dataset = LeRobotDataset(repo_id, episodes=[args.episode_index], root=root, tolerance_s=tolerance_s)
+    dataset = load_dataset_for_visualization(
+        repo_id,
+        episode_index=args.episode_index,
+        root=root,
+        tolerance_s=tolerance_s,
+    )
 
     visualize_dataset(dataset, **vars(args))
 

@@ -51,16 +51,28 @@ from lerobot.datasets.utils import (
     write_stats,
     write_tasks,
 )
-from lerobot.datasets.video_utils import VIDEO_TIMESTAMP_TOLERANCE_KEY
+from lerobot.datasets.video_utils import (
+    VIDEO_QUERY_TIMESTAMP_SOURCE_KEY,
+    VIDEO_TIMESTAMP_TOLERANCE_KEY,
+    resolve_video_query_timestamp_source,
+)
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
 
-def _preserve_video_timestamp_tolerance(
+def _preserve_video_read_contract(
     src_dataset: LeRobotDataset,
     dst_meta: LeRobotDatasetMetadata,
 ) -> None:
     if dst_meta.video_keys:
         dst_meta.info[VIDEO_TIMESTAMP_TOLERANCE_KEY] = src_dataset.video_timestamp_tolerance_s
+        if VIDEO_QUERY_TIMESTAMP_SOURCE_KEY in src_dataset.meta.info:
+            resolve_video_query_timestamp_source(
+                metadata_value=src_dataset.meta.info[VIDEO_QUERY_TIMESTAMP_SOURCE_KEY],
+                metadata_value_present=True,
+            )
+            dst_meta.info[VIDEO_QUERY_TIMESTAMP_SOURCE_KEY] = src_dataset.meta.info[
+                VIDEO_QUERY_TIMESTAMP_SOURCE_KEY
+            ]
 
 
 def _load_episode_with_stats(src_dataset: LeRobotDataset, episode_idx: int) -> dict:
@@ -125,7 +137,7 @@ def delete_episodes(
         root=output_dir,
         use_videos=len(dataset.meta.video_keys) > 0,
     )
-    _preserve_video_timestamp_tolerance(dataset, new_meta)
+    _preserve_video_read_contract(dataset, new_meta)
 
     episode_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(episodes_to_keep)}
 
@@ -217,7 +229,7 @@ def split_dataset(
             data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
             video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
         )
-        _preserve_video_timestamp_tolerance(dataset, new_meta)
+        _preserve_video_read_contract(dataset, new_meta)
 
         video_metadata = None
         if dataset.meta.video_keys:
@@ -365,7 +377,7 @@ def modify_features(
         root=output_dir,
         use_videos=len(remaining_video_keys) > 0,
     )
-    _preserve_video_timestamp_tolerance(dataset, new_meta)
+    _preserve_video_read_contract(dataset, new_meta)
 
     _copy_data_with_feature_changes(
         dataset=dataset,

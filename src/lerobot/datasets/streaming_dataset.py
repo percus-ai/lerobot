@@ -34,10 +34,12 @@ from lerobot.datasets.utils import (
     safe_shard,
 )
 from lerobot.datasets.video_utils import (
+    VIDEO_QUERY_TIMESTAMP_SOURCE_KEY,
     VIDEO_TIMESTAMP_TOLERANCE_KEY,
     VideoDecoderCache,
     decode_video_frames_torchcodec,
     resolve_timestamp_tolerances,
+    resolve_video_query_timestamp_source,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME, LOOKAHEAD_BACKTRACKTABLE, LOOKBACK_BACKTRACKTABLE
 
@@ -147,6 +149,10 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             metadata_tolerance=self.meta.info.get(VIDEO_TIMESTAMP_TOLERANCE_KEY),
             metadata_tolerance_present=VIDEO_TIMESTAMP_TOLERANCE_KEY in self.meta.info,
             fps=self.meta.fps,
+        )
+        self.video_query_uses_frame_index = resolve_video_query_timestamp_source(
+            metadata_value=self.meta.info.get(VIDEO_QUERY_TIMESTAMP_SOURCE_KEY),
+            metadata_value_present=VIDEO_QUERY_TIMESTAMP_SOURCE_KEY in self.meta.info,
         )
         # Check version
         check_version_compatibility(self.repo_id, self.meta._version, CODEBASE_VERSION)
@@ -270,7 +276,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         if indices is not None:
             return {
                 key: (
-                    start_ts + torch.tensor(indices[key]) / self.fps
+                    start_ts + torch.tensor(indices[key], dtype=torch.float64) / self.fps
                 ).tolist()  # NOTE: why not delta_timestamps directly?
                 for key in self.delta_timestamps
             }
@@ -318,7 +324,11 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         # Get episode index from the item
         ep_idx = item["episode_index"]
 
-        current_ts = float(item["timestamp"])
+        current_ts = (
+            int(item["frame_index"]) / self.fps
+            if self.video_query_uses_frame_index
+            else float(item["timestamp"])
+        )
 
         episode_boundaries_ts = {
             key: (
@@ -380,7 +390,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 timestamps = keys_to_timestamps[key]
                 # Clamp out timesteps outside of episode boundaries
                 query_timestamps[key] = torch.clamp(
-                    torch.tensor(timestamps), *episode_boundaries_ts[key]
+                    torch.tensor(timestamps, dtype=torch.float64), *episode_boundaries_ts[key]
                 ).tolist()
 
             else:

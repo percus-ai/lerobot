@@ -40,6 +40,8 @@ DEFAULT_DELTA_TIMESTAMP_TOLERANCE_S = 1e-4
 MAX_VIDEO_TIMESTAMP_TOLERANCE_S = 0.1
 VIDEO_TIMESTAMP_TOLERANCE_FRAMES = 3
 VIDEO_TIMESTAMP_TOLERANCE_KEY = "video_timestamp_tolerance_s"
+VIDEO_QUERY_TIMESTAMP_SOURCE_KEY = "video_query_timestamp_source"
+VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX = "frame_index_over_fps"
 VIDEO_DECODER_CACHE_CAPACITY = 32
 
 
@@ -86,6 +88,21 @@ def resolve_timestamp_tolerances(
         else default_video_timestamp_tolerance(fps)
     )
     return DEFAULT_DELTA_TIMESTAMP_TOLERANCE_S, video_tolerance_s
+
+
+def resolve_video_query_timestamp_source(
+    *,
+    metadata_value: Any,
+    metadata_value_present: bool,
+) -> bool:
+    if not metadata_value_present:
+        return False
+    if metadata_value != VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX:
+        raise ValueError(
+            f"meta.info[{VIDEO_QUERY_TIMESTAMP_SOURCE_KEY!r}] must be "
+            f"{VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX!r} when present"
+        )
+    return True
 
 
 def get_safe_default_codec():
@@ -195,8 +212,8 @@ def decode_video_frames_torchvision(
 
     reader = None
 
-    query_ts = torch.tensor(timestamps)
-    loaded_ts = torch.tensor(loaded_ts)
+    query_ts = torch.tensor(timestamps, dtype=torch.float64)
+    loaded_ts = torch.tensor(loaded_ts, dtype=torch.float64)
 
     # compute distances between each query timestamp and timestamps of all loaded frames
     dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
@@ -373,6 +390,15 @@ def decode_video_frames_torchcodec(
         bounded_timestamps = [min(max(timestamp, begin_stream_s), last_frame_pts) for timestamp in timestamps]
         previous_frames = decoder.get_frames_played_at(seconds=bounded_timestamps)
 
+        if (
+            previous_frames.pts_seconds.dtype != torch.float64
+            or previous_frames.duration_seconds.dtype != torch.float64
+        ):
+            raise FrameTimestampError(
+                "TorchCodec must expose float64 PTS and frame durations for exact VFR nearest-frame matching "
+                f"in {video_path}"
+            )
+
         previous_pts = previous_frames.pts_seconds.cpu()
         query_ts = torch.tensor(timestamps, dtype=previous_frames.pts_seconds.dtype)
         estimated_successor_pts = previous_pts + previous_frames.duration_seconds.cpu()
@@ -398,6 +424,11 @@ def decode_video_frames_torchcodec(
         successor_data: dict[int, torch.Tensor] = {}
         if successor_timestamps:
             successor_frames = decoder.get_frames_played_at(seconds=successor_timestamps)
+            if successor_frames.pts_seconds.dtype != torch.float64:
+                raise FrameTimestampError(
+                    "TorchCodec must expose float64 successor PTS for exact VFR nearest-frame matching "
+                    f"in {video_path}"
+                )
             for source_index, successor_frame, successor_pts in zip(
                 successor_indices,
                 successor_frames.data,

@@ -17,6 +17,7 @@ import logging
 import re
 from itertools import chain
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -192,6 +193,80 @@ def test_dataset_feature_with_forward_slash_raises_error():
             fps=30,
             features={"a/b": {"dtype": "float32", "shape": 2, "names": None}},
         )
+
+
+def test_video_query_timestamp_uses_frame_index_without_float32_drift() -> None:
+    dataset = LeRobotDataset.__new__(LeRobotDataset)
+    dataset.meta = type("Meta", (), {"fps": 30, "video_keys": ["camera"]})()
+    dataset._absolute_to_relative_idx = None
+    dataset.hf_dataset = None
+    dataset.video_query_uses_frame_index = True
+    frame_index = 108_001
+    expected = frame_index / 30
+    persisted_float32 = float(np.float32(expected))
+
+    query = dataset._get_query_timestamps(persisted_float32, frame_index)
+
+    assert persisted_float32 != expected
+    assert query == {"camera": [expected]}
+
+
+def test_video_query_timestamp_preserves_legacy_dataset_timestamp() -> None:
+    dataset = LeRobotDataset.__new__(LeRobotDataset)
+    dataset.meta = type("Meta", (), {"fps": 30, "video_keys": ["camera"]})()
+    dataset._absolute_to_relative_idx = None
+    dataset.hf_dataset = None
+    dataset.video_query_uses_frame_index = False
+
+    query = dataset._get_query_timestamps(0.125, 30)
+
+    assert query == {"camera": [0.125]}
+
+
+def test_video_delta_query_uses_absolute_index_for_episode_subset() -> None:
+    class EpisodeSubset:
+        def __init__(self) -> None:
+            self.rows = [
+                {
+                    "timestamp": torch.tensor(frame_index / 30),
+                    "frame_index": torch.tensor(frame_index),
+                    "episode_index": torch.tensor(1),
+                    "index": torch.tensor(absolute_index),
+                    "task_index": torch.tensor(0),
+                }
+                for frame_index, absolute_index in enumerate((3, 4, 5))
+            ]
+
+        def __getitem__(self, index: int):
+            return self.rows[index]
+
+    dataset = LeRobotDataset.__new__(LeRobotDataset)
+    dataset.hf_dataset = EpisodeSubset()
+    dataset.meta = SimpleNamespace(
+        episodes={
+            0: {"dataset_from_index": 0, "dataset_to_index": 3},
+            1: {"dataset_from_index": 3, "dataset_to_index": 6},
+        },
+        video_keys=["camera"],
+        tasks=SimpleNamespace(iloc=[SimpleNamespace(name="task")]),
+    )
+    dataset.delta_indices = {"camera": [-1, 0, 1]}
+    dataset._absolute_to_relative_idx = {3: 0, 4: 1, 5: 2}
+    dataset._lazy_loading = False
+    dataset.image_transforms = None
+    captured_query_indices = None
+
+    def capture_query_timestamps(current_ts, current_frame_index, query_indices):
+        nonlocal captured_query_indices
+        captured_query_indices = query_indices
+        return {"camera": [0.0, 1 / 30, 2 / 30]}
+
+    dataset._get_query_timestamps = capture_query_timestamps
+    dataset._query_videos = lambda query_timestamps, episode_index: {"camera": torch.zeros(3, 3, 1, 1)}
+
+    dataset[1]
+
+    assert captured_query_indices == {"camera": [3, 4, 5]}
 
 
 def test_add_frame_missing_task(tmp_path, empty_lerobot_dataset_factory):

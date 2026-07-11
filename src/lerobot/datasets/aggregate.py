@@ -40,10 +40,13 @@ from lerobot.datasets.utils import (
     write_tasks,
 )
 from lerobot.datasets.video_utils import (
+    VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX,
+    VIDEO_QUERY_TIMESTAMP_SOURCE_KEY,
     VIDEO_TIMESTAMP_TOLERANCE_KEY,
     concatenate_video_files,
     get_video_duration_in_s,
     resolve_timestamp_tolerances,
+    resolve_video_query_timestamp_source,
     validate_video_timestamp_tolerance,
 )
 
@@ -82,6 +85,25 @@ def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
             )
 
     return fps, robot_type, features
+
+
+def _resolve_aggregate_video_query_timestamp_source(
+    all_metadata: list[LeRobotDatasetMetadata],
+) -> str | None:
+    sources = {
+        resolve_video_query_timestamp_source(
+            metadata_value=meta.info.get(VIDEO_QUERY_TIMESTAMP_SOURCE_KEY),
+            metadata_value_present=VIDEO_QUERY_TIMESTAMP_SOURCE_KEY in meta.info,
+        )
+        for meta in all_metadata
+    }
+    if len(sources) != 1:
+        raise ValueError(
+            "Cannot aggregate datasets with mixed video query timestamp sources: "
+            f"all datasets must either declare {VIDEO_QUERY_TIMESTAMP_SOURCE_KEY!r}="
+            f"{VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX!r} or all omit it"
+        )
+    return VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX if sources.pop() else None
 
 
 def update_data_df(df, src_meta, dst_meta):
@@ -215,6 +237,9 @@ def aggregate_datasets(
     )
     fps, robot_type, features = validate_all_metadata(all_metadata)
     video_keys = [key for key in features if features[key]["dtype"] == "video"]
+    video_query_timestamp_source = (
+        _resolve_aggregate_video_query_timestamp_source(all_metadata) if video_keys else None
+    )
 
     dst_meta = LeRobotDatasetMetadata.create(
         repo_id=aggr_repo_id,
@@ -244,6 +269,8 @@ def aggregate_datasets(
                 for meta in all_metadata
             )
         )
+        if video_query_timestamp_source is not None:
+            dst_meta.info[VIDEO_QUERY_TIMESTAMP_SOURCE_KEY] = video_query_timestamp_source
 
     logging.info("Find all tasks")
     unique_tasks = pd.concat([m.tasks for m in all_metadata]).index.unique()
