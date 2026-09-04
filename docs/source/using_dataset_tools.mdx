@@ -75,6 +75,25 @@ lerobot-edit-dataset \
     --operation.repo_ids "['lerobot/pusht_train', 'lerobot/pusht_val']"
 ```
 
+Video concatenation copies compressed packets without re-encoding. Inputs must contain
+exactly one video stream, with matching codec, resolution, pixel format and fixed frame
+duration (one packet per frame). Presentation timestamps must cover consecutive frames
+starting at zero; decode timestamps must advance at that same fixed interval. Missing
+timestamps, unknown packet durations, irregular timelines and additional streams are
+rejected, not silently repaired or discarded.
+
+Different MP4 time bases are converted exactly to a common integer timescale. When
+B-frame settings produce different decode delays, the concatenator moves decode timestamps
+earlier to match the largest input delay. Presentation timestamps only receive the duration
+of preceding clips, keeping dataset frame timestamps unchanged. Negative initial decode
+timestamps are intentional. H.264/HEVC parameter sets are preserved in-band (`avc3`/`hev1`);
+other codecs require matching initialization data. Input random-access/GOP limitations
+are not repaired by concatenation.
+
+Video durations used for episode offsets come from the validated packet count and frame
+duration, not container-declared duration. A failed concatenation leaves an existing
+destination untouched, including when appending to that same file.
+
 #### Remove Features
 
 Remove features from a dataset.
