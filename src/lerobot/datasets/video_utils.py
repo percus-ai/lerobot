@@ -404,8 +404,9 @@ def concatenate_video_files(
     Concatenate multiple video files into a single video file using pyav.
 
     This function takes a list of video input file paths and concatenates them into a single
-    output video file. It uses ffmpeg's concat demuxer with stream copy mode for fast
-    concatenation without re-encoding.
+    output video file. Packets of the first video stream of each input are stream-copied
+    (no re-encode) onto an exact frame-grid timeline, with a minimal dts adjustment at
+    file boundaries to satisfy the muxer's strict monotonicity (see inline note).
 
     Args:
         input_video_paths: Ordered list of input video file paths to concatenate.
@@ -413,9 +414,9 @@ def concatenate_video_files(
         overwrite: Whether to overwrite the output video file if it already exists. Default is True.
 
     Note:
-        - Creates a temporary directory for intermediate files that is cleaned up after use.
-        - Uses ffmpeg's concat demuxer which requires all input videos to have the same
-          codec, resolution, and frame rate for proper concatenation.
+        - Creates a temporary file for the output that is cleaned up on failure.
+        - All inputs must share codec, resolution, frame rate and constant frame
+          duration. Only the first video stream of each input is copied.
     """
 
     output_video_path = Path(output_video_path)
@@ -429,55 +430,88 @@ def concatenate_video_files(
     if len(input_video_paths) == 0:
         raise FileNotFoundError("No input video paths provided.")
 
-    # Create a temporary .ffconcat file to list the input video paths
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".ffconcat", delete=False) as tmp_concatenate_file:
-        tmp_concatenate_file.write("ffconcat version 1.0\n")
-        for input_path in input_video_paths:
-            tmp_concatenate_file.write(f"file '{str(input_path.resolve())}'\n")
-        tmp_concatenate_file.flush()
-        tmp_concatenate_path = tmp_concatenate_file.name
-
-    # Create input and output containers
-    input_container = av.open(
-        tmp_concatenate_path, mode="r", format="concat", options={"safe": "0"}
-    )  # safe = 0 allows absolute paths as well as relative paths
-
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
+    # NOTE: this used to go through ffmpeg's concat demuxer, which offsets each
+    # subsequent file by the *declared* container duration. That breaks in two ways
+    # for the videos this library writes:
+    #   1. Sources encoded with B-frames start at a negative dts (-1 or -2 frames).
+    #     When a file with a larger start delay follows one with a smaller delay,
+    #     the first offset dts is <= the previous file's last dts and the mp4 muxer
+    #     rejects the packet ("non monotonically increasing dts ... X >= X").
+    #   2. Declared durations are not always a multiple of the frame duration, so
+    #     every subsequent file lands off the frame grid; the accumulated shift can
+    #     exceed decode-time timestamp tolerances (tolerance_s) downstream.
+    # Instead, remux each file at an exact frame-grid offset (n_frames * frame
+    # duration), keep pts mapping exact, and nudge only dts by the minimal amount
+    # needed to stay strictly monotonic.
+    with tempfile.NamedTemporaryFile(suffix=output_video_path.suffix, delete=False) as tmp_named_file:
         tmp_output_video_path = tmp_named_file.name
 
-    output_container = av.open(
-        tmp_output_video_path, mode="w", options={"movflags": "faststart"}
-    )  # faststart is to move the metadata to the beginning of the file to speed up loading
+    output_container = None
+    output_stream = None
+    base_ticks = 0
+    last_out_dts: int | None = None
+    try:
+        for input_path in input_video_paths:
+            input_path = Path(input_path)
+            n_frames, pkt_dur, first_dts = _scan_video_packets(input_path)
+            if n_frames == 0:
+                raise ValueError(f"No video packets found in {input_path}")
+            if pkt_dur is None:
+                raise ValueError(
+                    f"Variable packet duration in {input_path}; frame-grid concatenation "
+                    "requires constant-frame-duration inputs"
+                )
 
-    # Replicate input streams in output container
-    stream_map = {}
-    for input_stream in input_container.streams:
-        if input_stream.type in ("video", "audio", "subtitle"):  # only copy compatible streams
-            stream_map[input_stream.index] = output_container.add_stream_from_template(
-                template=input_stream, opaque=True
-            )
+            input_container = av.open(str(input_path))
+            input_stream = input_container.streams.video[0]
+            if output_container is None:
+                output_container = av.open(
+                    tmp_output_video_path, mode="w", options={"movflags": "faststart"}
+                )  # faststart moves the metadata to the beginning of the file to speed up loading
+                output_stream = output_container.add_stream_from_template(
+                    template=input_stream, opaque=True
+                )
+                # set the time base to the input stream time base (missing in the codec context)
+                output_stream.time_base = input_stream.time_base
 
-            # set the time base to the input stream time base (missing in the codec context)
-            stream_map[input_stream.index].time_base = input_stream.time_base
+            # Minimal dts nudge to keep the muxer's strict monotonicity across the
+            # boundary (only needed when this file's start delay exceeds the
+            # previous file's end headroom; pts is never touched).
+            dts_shift = 0
+            if last_out_dts is not None and first_dts is not None:
+                incoming_dts = base_ticks + first_dts
+                if incoming_dts <= last_out_dts:
+                    dts_shift = last_out_dts + 1 - incoming_dts
 
-    # Demux + remux packets (no re-encode)
-    for packet in input_container.demux():
-        # Skip packets from un-mapped streams
-        if packet.stream.index not in stream_map:
-            continue
+            for packet in input_container.demux(input_stream):
+                # Skip demux flushing packets
+                if packet.dts is None:
+                    continue
+                pts = packet.pts if packet.pts is not None else packet.dts
+                new_pts = pts + base_ticks
+                new_dts = packet.dts + base_ticks + dts_shift
+                if new_dts > new_pts:
+                    raise ValueError(
+                        f"dts monotonicity fix would overtake pts in {input_path} "
+                        f"(shift={dts_shift}); refusing to write an invalid stream"
+                    )
+                packet.pts = new_pts
+                packet.dts = new_dts
+                packet.stream = output_stream
+                output_container.mux(packet)
+                last_out_dts = new_dts
 
-        # Skip demux flushing packets
-        if packet.dts is None:
-            continue
+            input_container.close()
+            base_ticks += n_frames * pkt_dur
 
-        output_stream = stream_map[packet.stream.index]
-        packet.stream = output_stream
-        output_container.mux(packet)
-
-    input_container.close()
-    output_container.close()
-    shutil.move(tmp_output_video_path, output_video_path)
-    Path(tmp_concatenate_path).unlink()
+        output_container.close()
+        output_container = None
+        shutil.move(tmp_output_video_path, output_video_path)
+    finally:
+        if output_container is not None:
+            output_container.close()
+        if Path(tmp_output_video_path).exists():
+            Path(tmp_output_video_path).unlink()
 
 
 @dataclass
@@ -590,9 +624,43 @@ def get_video_pixel_channels(pix_fmt: str) -> int:
         raise ValueError("Unknown format")
 
 
+def _scan_video_packets(video_path: Path | str) -> tuple[int, int | None, int | None]:
+    """Scan the first video stream and return (n_packets, packet_duration, first_dts).
+
+    packet_duration is the constant per-packet duration in stream time_base units,
+    or None if packets have no/variable duration. first_dts is the dts of the first
+    packet (can be negative when the encoder uses B-frames).
+    """
+    n = 0
+    pkt_dur: int | None = None
+    uniform = True
+    first_dts: int | None = None
+    with av.open(str(video_path)) as container:
+        stream = container.streams.video[0]
+        for packet in container.demux(stream):
+            if packet.dts is None:
+                continue
+            if first_dts is None:
+                first_dts = packet.dts
+            if packet.duration:
+                if pkt_dur is None:
+                    pkt_dur = int(packet.duration)
+                elif int(packet.duration) != pkt_dur:
+                    uniform = False
+            n += 1
+    return n, (pkt_dur if uniform else None), first_dts
+
+
 def get_video_duration_in_s(video_path: Path | str) -> float:
     """
     Get the duration of a video file in seconds using PyAV.
+
+    For constant-frame-duration videos (the ones this library writes), the duration
+    is computed exactly as n_frames * frame_duration * time_base. The declared
+    container/stream duration is only used as a fallback: it is not always a
+    multiple of the frame duration (mp4 edit lists, muxer rounding), and using it
+    as a concatenation offset shifts every subsequent frame off the frame grid,
+    which can push frame lookup errors past decoding tolerances downstream.
 
     Args:
         video_path: Path to the video file.
@@ -601,15 +669,17 @@ def get_video_duration_in_s(video_path: Path | str) -> float:
         Duration of the video in seconds.
     """
     with av.open(str(video_path)) as container:
-        # Get the first video stream
         video_stream = container.streams.video[0]
-        # Calculate duration: stream.duration * stream.time_base gives duration in seconds
-        if video_stream.duration is not None:
-            duration = float(video_stream.duration * video_stream.time_base)
-        else:
-            # Fallback to container duration if stream duration is not available
-            duration = float(container.duration / av.time_base)
-    return duration
+        time_base = video_stream.time_base
+        declared = (
+            float(video_stream.duration * time_base)
+            if video_stream.duration is not None
+            else float(container.duration / av.time_base)
+        )
+    n_frames, pkt_dur, _first_dts = _scan_video_packets(video_path)
+    if n_frames > 0 and pkt_dur is not None:
+        return float(n_frames * pkt_dur * time_base.numerator / time_base.denominator)
+    return declared
 
 
 class VideoEncodingManager:
