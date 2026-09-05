@@ -112,11 +112,11 @@ def assert_concatenated(paths: list[Path], output: Path, step: Fraction = Fracti
     for path in paths:
         source = decoded_frames(path)
         offset = len(expected) * step
-        expected.extend((pts + offset, pixels) for pts, pixels in source)
+        expected.extend((i * step + offset, pixels) for i, (_, pixels) in enumerate(source))
         boundaries.update((len(expected) - 1, len(expected), len(expected) + 1))
     assert decoded_frames(output) == expected
     stamps = packet_timestamps(output)
-    delay = max(-packet_timestamps(path)[0][1] for path in paths)
+    delay = max(video_timeline.scan_video_timeline(path).decode_delay for path in paths)
     assert len(stamps) == len(expected)
     assert [dts for _, dts, _ in stamps] == [i * step - delay for i in range(len(expected))]
     assert all(dts <= pts and duration == step for pts, dts, duration in stamps)
@@ -153,9 +153,9 @@ def clips(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
         result[name] = path
     assert [video_timeline.scan_video_timeline(result[name]).decode_delay for name in settings] == [
         Fraction(0),
+        Fraction(0),
         Fraction(1, 30),
-        Fraction(2, 30),
-        Fraction(1, 30),
+        Fraction(0),
     ]
     return result
 
@@ -168,7 +168,8 @@ def test_mixed_decode_delays_and_time_bases(tmp_path: Path, clips: dict[str, Pat
     assert_concatenated(paths, output)
     assert h264_image_payloads(output) == [payload for path in paths for payload in h264_image_payloads(path)]
     with av.open(str(output)) as container:
-        assert container.streams.video[0].codec_context.codec_tag == "avc3"
+        tag = container.streams.video[0].codec_context.codec_tag
+        assert tag == ("avc1" if set(names) == {"g2", "tb90"} else "avc3")
 
 
 def test_incremental_in_place_equals_one_shot(tmp_path: Path, clips: dict[str, Path]):
@@ -220,11 +221,10 @@ def test_fractional_fps(tmp_path: Path):
         ("pts", "requires PTS, DTS"),
         ("dts", "requires PTS, DTS"),
         ("duration", "positive duration"),
-        ("dts_step", "nonuniform DTS"),
-        ("duration_step", "nonuniform DTS or duration"),
-        ("off_grid", "off-grid PTS"),
-        ("duplicate", "duplicate PTS"),
-        ("origin", "starting at zero"),
+        ("duration_step", "nonuniform duration"),
+        ("off_grid", "nonuniform PTS"),
+        ("duplicate", "duplicate or reversed"),
+        ("origin", "start at zero"),
         ("keyframe", "start with a keyframe"),
         ("empty", "no video packets"),
     ],

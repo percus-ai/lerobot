@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exact, zero-origin CFR timelines for lossless dataset video concatenation."""
+"""Frame-order timelines for lossless CFR dataset video concatenation."""
 
+import logging
 import math
 import tempfile
 from collections.abc import Iterator, Sequence
@@ -30,8 +31,11 @@ class VideoTimeline(BaseModel):
     path: Path
     time_base: Fraction
     frame_ticks: int
-    first_dts: int
     frame_count: int
+    presentation_indices: tuple[int, ...]
+    source_pts: tuple[int, ...]
+    source_dts: tuple[int, ...]
+    codec_tag: str
     codec: str
     width: int
     height: int
@@ -48,7 +52,7 @@ class VideoTimeline(BaseModel):
 
     @property
     def decode_delay(self) -> Fraction:
-        return -self.first_dts * self.time_base
+        return max(0, max(i - rank for i, rank in enumerate(self.presentation_indices))) * self.frame_duration
 
 
 def _video_packets(container: av.container.InputContainer) -> Iterator[av.Packet]:
@@ -60,7 +64,13 @@ def _video_packets(container: av.container.InputContainer) -> Iterator[av.Packet
 
 
 def scan_video_timeline(path: Path | str) -> VideoTimeline:
-    """Validate the actual PTS/DTS lattice, without trusting declared duration/FPS."""
+    """Validate complete CFR segments and map packets to decoded presentation order.
+
+    Old joins may have nonuniform DTS or a PTS offset at a new keyframe. Neither
+    changes frame identity. COPY_OPAQUE proves the packet/frame correspondence;
+    packet order is never confused with presentation order. Within each segment
+    displayed frames must remain exactly one frame duration apart.
+    """
     path = Path(path)
     with av.open(str(path)) as container:
         if len(container.streams) != 1 or len(container.streams.video) != 1:
@@ -69,10 +79,34 @@ def scan_video_timeline(path: Path | str) -> VideoTimeline:
         time_base = stream.time_base
         if time_base is None or time_base <= 0:
             raise ValueError(f"{path}: missing or invalid video time base")
-        frame_ticks = first_dts = None
-        count = next_pts_index = 0
-        pending_pts: set[int] = set()
+        frame_ticks = first_dts = previous_dts = previous_pts = None
+        source_pts: list[int] = []
+        source_dts: list[int] = []
+        ranks: dict[int, int] = {}
+        decoder = stream.codec_context
+        decoder.flags |= av.codec.context.Flags.copy_opaque
+
+        def accept_frames(frames: list[av.VideoFrame]) -> None:
+            nonlocal previous_pts
+            for frame in frames:
+                index = frame.opaque
+                if not isinstance(index, int) or index in ranks or not 0 <= index < len(source_pts):
+                    raise ValueError(f"{path}: requires exactly one decoded frame per packet")
+                pts = frame.pts
+                if pts is None or pts != source_pts[index]:
+                    raise ValueError(f"{path}: decoded frame has missing or inconsistent PTS")
+                if previous_pts is None:
+                    if pts != 0:
+                        raise ValueError(f"{path}: PTS must start at zero")
+                elif pts <= previous_pts:
+                    raise ValueError(f"{path}: duplicate or reversed presentation timestamps")
+                elif pts - previous_pts != frame_ticks and not frame.key_frame:
+                    raise ValueError(f"{path}: nonuniform PTS within a segment; expected CFR")
+                ranks[index] = len(ranks)
+                previous_pts = pts
+
         for packet in _video_packets(container):
+            count = len(source_pts)
             pts, dts, duration = packet.pts, packet.dts, packet.duration
             if pts is None or dts is None or duration is None or duration <= 0:
                 raise ValueError(f"{path}: packet {count} requires PTS, DTS and a positive duration")
@@ -82,31 +116,32 @@ def scan_video_timeline(path: Path | str) -> VideoTimeline:
                 if not packet.is_keyframe or dts > 0:
                     raise ValueError(f"{path}: must start with a keyframe and nonpositive DTS")
                 first_dts, frame_ticks = dts, duration
-            if duration != frame_ticks or dts != first_dts + count * frame_ticks:
-                raise ValueError(f"{path}: packet {count} has nonuniform DTS or duration; expected CFR")
-            if dts > pts or pts < 0 or pts % frame_ticks:
-                raise ValueError(f"{path}: packet {count} has invalid PTS/DTS or an off-grid PTS")
-            pts_index = pts // frame_ticks
-            if pts_index < next_pts_index or pts_index in pending_pts:
-                raise ValueError(f"{path}: packet {count} has a duplicate PTS")
-            pending_pts.add(pts_index)
-            # Retain only the reorder window, not a timestamp list for the entire video.
-            while next_pts_index in pending_pts:
-                pending_pts.remove(next_pts_index)
-                next_pts_index += 1
-            count += 1
+            if duration != frame_ticks:
+                raise ValueError(f"{path}: packet {count} has nonuniform duration; expected CFR")
+            if dts > pts or pts < 0 or (previous_dts is not None and dts <= previous_dts):
+                raise ValueError(f"{path}: packet {count} has invalid PTS/DTS")
+            source_pts.append(pts)
+            source_dts.append(dts)
+            packet.opaque = count
+            previous_dts = dts
+            accept_frames(decoder.decode(packet))
         if first_dts is None or frame_ticks is None:
             raise ValueError(f"{path}: no video packets")
-        if pending_pts:
-            raise ValueError(f"{path}: PTS must cover consecutive frames starting at zero")
+        accept_frames(decoder.decode(None))
+        count = len(source_pts)
+        if len(ranks) != count:
+            raise ValueError(f"{path}: decoded frame count does not match packet count")
         if stream.codec_context.format is None or not stream.codec_context.extradata:
             raise ValueError(f"{path}: missing video format or codec initialization data")
         return VideoTimeline(
             path=path,
             time_base=time_base,
             frame_ticks=frame_ticks,
-            first_dts=first_dts,
             frame_count=count,
+            presentation_indices=tuple(ranks[i] for i in range(count)),
+            source_pts=tuple(source_pts),
+            source_dts=tuple(source_dts),
+            codec_tag=stream.codec_context.codec_tag,
             codec=stream.codec_context.name,
             width=stream.codec_context.width,
             height=stream.codec_context.height,
@@ -115,9 +150,10 @@ def scan_video_timeline(path: Path | str) -> VideoTimeline:
         )
 
 
-def remux_video_files(input_paths: Sequence[Path | str], output_path: Path) -> None:
-    """Remux prevalidated CFR clips, preserving PTS and sharing one decode delay."""
-    clips = [scan_video_timeline(path) for path in input_paths]
+def remux_video_files(clips: Sequence[VideoTimeline], output_path: Path) -> None:
+    """Generate one CFR clock from verified frame order, without recompression."""
+    if not clips:
+        raise ValueError("At least one validated video timeline is required")
     first = clips[0]
     for clip in clips[1:]:
         if (clip.codec, clip.width, clip.height, clip.pixel_format, clip.frame_duration) != (
@@ -141,6 +177,10 @@ def remux_video_files(input_paths: Sequence[Path | str], output_path: Path) -> N
     frame_ticks = int(first.frame_duration / time_base)
     delay_ticks = int(delay / time_base)
     bitstream_filter = {"h264": "h264_mp4toannexb", "hevc": "hevc_mp4toannexb"}.get(first.codec)
+    inline_headers = bitstream_filter is not None and (
+        any(clip.extradata != first.extradata for clip in clips)
+        or any(clip.codec_tag in {"avc3", "hev1"} for clip in clips)
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     # Keep the original intact on failure, including when it is also an input.
@@ -158,7 +198,7 @@ def remux_video_files(input_paths: Sequence[Path | str], output_path: Path) -> N
         ) as output:
             with av.open(str(first.path)) as template:
                 stream = output.add_stream_from_template(template.streams.video[0], opaque=True)
-                if bitstream_filter is not None:
+                if inline_headers:
                     # Initialize output extradata too. Each clip's parameter sets must
                     # travel with its packets when encoder settings differ (e.g. B-frames).
                     av.bitstream.BitStreamFilterContext(bitstream_filter, template.streams.video[0], stream)
@@ -169,12 +209,17 @@ def remux_video_files(input_paths: Sequence[Path | str], output_path: Path) -> N
                 raise ValueError("MP4 muxer changed the requested exact video time base")
             offset = 0
             for clip in clips:
-                scale = int(clip.time_base / time_base)
-                clip_delay = int(clip.decode_delay / time_base)
+                if any(
+                    pts != rank * clip.frame_ticks
+                    for pts, rank in zip(clip.source_pts, clip.presentation_indices, strict=True)
+                ):
+                    logging.info(
+                        "Normalizing presentation timestamps from verified frame order: %s", clip.path
+                    )
                 with av.open(str(clip.path)) as source:
                     packet_filter = (
                         av.bitstream.BitStreamFilterContext(bitstream_filter, source.streams.video[0])
-                        if bitstream_filter is not None
+                        if inline_headers
                         else None
                     )
                     count = 0
@@ -183,17 +228,18 @@ def remux_video_files(input_paths: Sequence[Path | str], output_path: Path) -> N
                         if (
                             pts is None
                             or dts is None
+                            or count >= clip.frame_count
                             or packet.duration != clip.frame_ticks
                             or packet.time_base != clip.time_base
-                            or dts != clip.first_dts + count * clip.frame_ticks
+                            or pts != clip.source_pts[count]
+                            or dts != clip.source_dts[count]
                         ):
                             raise ValueError(f"{clip.path}: packet timeline changed after validation")
-                        # R = max(input decode delays), C = preceding frame duration.
-                        # PTS' = PTS + C; DTS' = DTS + C - (R - input delay).
-                        # Thus DTS' = C - R + j*T. Boundaries are exactly T apart,
-                        # and DTS only moves earlier, preserving DTS <= PTS.
-                        pts = pts * scale + offset
-                        dts = dts * scale + offset - (delay_ticks - clip_delay)
+                        # r = decoded presentation rank; j = unchanged packet order.
+                        # R = max((j-r)*T) over all inputs. Thus DTS is strictly
+                        # increasing and DTS <= PTS, including old/new boundaries.
+                        pts = clip.presentation_indices[count] * frame_ticks + offset
+                        dts = count * frame_ticks + offset - delay_ticks
                         if packet_filter is not None:
                             filtered = packet_filter.filter(packet)
                             if len(filtered) != 1:

@@ -75,24 +75,35 @@ lerobot-edit-dataset \
     --operation.repo_ids "['lerobot/pusht_train', 'lerobot/pusht_val']"
 ```
 
-Video concatenation copies compressed packets without re-encoding. Inputs must contain
-exactly one video stream, with matching codec, resolution, pixel format and fixed frame
-duration (one packet per frame). Presentation timestamps must cover consecutive frames
-starting at zero; decode timestamps must advance at that same fixed interval. Missing
-timestamps, unknown packet durations, irregular timelines and additional streams are
-rejected, not silently repaired or discarded.
+Aggregation preserves the image paired with every action row, including when adding C
+to a previously merged A+B video. It decodes each input to verify presentation order,
+then copies compressed packets without re-encoding. This adds a CPU decoding pass;
+compressed image data, action/state values and episode-local row timestamps are unchanged.
 
-Different MP4 time bases are converted exactly to a common integer timescale. When
-B-frame settings produce different decode delays, the concatenator moves decode timestamps
-earlier to match the largest input delay. Presentation timestamps only receive the duration
-of preceding clips, keeping dataset frame timestamps unchanged. Negative initial decode
-timestamps are intentional. H.264/HEVC parameter sets are preserved in-band (`avc3`/`hev1`);
-other codecs require matching initialization data. Input random-access/GOP limitations
-are not repaired by concatenation.
+Each output frame receives PTS = presentation index / FPS. Packets retain decoding order
+and receive DTS = packet index / FPS - R, where R is the largest positive difference
+between decoding index and presentation index, divided by FPS, across all inputs.
+Consequently DTS increases strictly and never exceeds PTS, even with mixed B-frame
+settings. Negative initial DTS is intentional. MP4 time bases are converted exactly to
+a common integer timescale; differing H.264/HEVC parameter sets are retained in-band.
 
-Video durations used for episode offsets come from the validated packet count and frame
-duration, not container-declared duration. A failed concatenation leaves an existing
-destination untouched, including when appending to that same file.
+Previously merged files may have irregular DTS intervals or a PTS offset at a new
+keyframe. These clocks are regenerated using the same rule as new inputs. Episode video
+from/to timestamps are regenerated from frame counts too, including for first and rotated
+output files. Correcting video timestamps alone would leave image/action references wrong.
+
+This requires exactly one video stream, one decoded frame per packet, matching codec,
+resolution, pixel format and fixed packet duration. Each episode must have consecutive
+frame indices and row timestamps equal to frame_index / FPS (allowing only float32
+serialization error). Video frame counts must match episode lengths. Missing timestamps,
+duplicate/reversed presentation times, nonuniform presentation times within a segment,
+missing frames and custom row clocks are rejected rather than guessed. Input random-access
+or damaged image data cannot be repaired by retiming.
+
+A failed concatenation leaves an existing video untouched. Aggregation publishes its new
+dataset directory only after videos, rows and metadata all succeed; source datasets remain
+untouched. The low-level concatenate_video_files function does not update external metadata;
+dataset callers must use the frame-count clock for their episode references.
 
 #### Remove Features
 

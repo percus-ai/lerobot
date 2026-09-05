@@ -406,8 +406,8 @@ def concatenate_video_files(
     Concatenate multiple video files into a single video file using pyav.
 
     This function takes a list of video input file paths and concatenates them into a single
-    output MP4 without re-encoding. All inputs share a common decode delay so that
-    DTS stays strictly increasing without moving the presentation timeline.
+    output MP4 without re-encoding. Decoded frame order defines a common CFR clock;
+    a shared decode delay keeps DTS strictly increasing and no later than PTS.
 
     Args:
         input_video_paths: Ordered list of input video file paths to concatenate.
@@ -416,11 +416,14 @@ def concatenate_video_files(
 
     Note:
         - Requires one video stream per input, matching codec, dimensions, pixel format,
-          and fixed frame duration. PTS must cover consecutive frames starting at zero;
-          DTS and packet duration must have the same fixed interval (one packet per frame).
+          and fixed packet duration (one decoded frame per packet). PTS starts at zero
+          and is uniform within segments; offsets at new keyframes are normalized.
+          Nonuniform but strictly increasing input DTS is accepted.
+        - Callers owning episode references must regenerate their video offsets from
+          frame counts as well. aggregate_datasets does this and validates row timestamps.
         - Missing timestamps or unsupported timelines raise ValueError before writing.
         - Input time bases and H.264/HEVC reorder delays may differ. Codec parameter
-          sets are retained in-band, without recompressing frames.
+          sets are retained in-band when necessary, without recompressing frames.
         - Replaces the destination atomically only after successful muxing.
     """
 
@@ -433,7 +436,7 @@ def concatenate_video_files(
     if len(input_video_paths) == 0:
         raise FileNotFoundError("No input video paths provided.")
 
-    remux_video_files(input_video_paths, output_video_path)
+    remux_video_files([scan_video_timeline(path) for path in input_video_paths], output_video_path)
 
 
 @dataclass
