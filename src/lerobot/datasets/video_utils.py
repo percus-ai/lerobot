@@ -17,8 +17,8 @@ import glob
 import importlib
 import logging
 import shutil
-import tempfile
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -31,6 +31,8 @@ import torch
 import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
+
+from lerobot.datasets.video_timeline import remux_video_files, scan_video_timeline
 
 
 def get_safe_default_codec():
@@ -398,14 +400,14 @@ def encode_video_frames(
 
 
 def concatenate_video_files(
-    input_video_paths: list[Path | str], output_video_path: Path, overwrite: bool = True
-):
+    input_video_paths: Sequence[Path | str], output_video_path: Path, overwrite: bool = True
+) -> None:
     """
     Concatenate multiple video files into a single video file using pyav.
 
     This function takes a list of video input file paths and concatenates them into a single
-    output video file. It uses ffmpeg's concat demuxer with stream copy mode for fast
-    concatenation without re-encoding.
+    output MP4 without re-encoding. Decoded frame order defines a common CFR clock;
+    a shared decode delay keeps DTS strictly increasing and no later than PTS.
 
     Args:
         input_video_paths: Ordered list of input video file paths to concatenate.
@@ -413,9 +415,16 @@ def concatenate_video_files(
         overwrite: Whether to overwrite the output video file if it already exists. Default is True.
 
     Note:
-        - Creates a temporary directory for intermediate files that is cleaned up after use.
-        - Uses ffmpeg's concat demuxer which requires all input videos to have the same
-          codec, resolution, and frame rate for proper concatenation.
+        - Requires one video stream per input, matching codec, dimensions, pixel format,
+          and fixed packet duration (one decoded frame per packet). PTS starts at zero
+          and is uniform within segments; offsets at new keyframes are normalized.
+          Nonuniform but strictly increasing input DTS is accepted.
+        - Callers owning episode references must regenerate their video offsets from
+          frame counts as well. aggregate_datasets does this and validates row timestamps.
+        - Missing timestamps or unsupported timelines raise ValueError before writing.
+        - Input time bases and H.264/HEVC reorder delays may differ. Codec parameter
+          sets are retained in-band when necessary, without recompressing frames.
+        - Replaces the destination atomically only after successful muxing.
     """
 
     output_video_path = Path(output_video_path)
@@ -424,60 +433,10 @@ def concatenate_video_files(
         logging.warning(f"Video file already exists: {output_video_path}. Skipping concatenation.")
         return
 
-    output_video_path.parent.mkdir(parents=True, exist_ok=True)
-
     if len(input_video_paths) == 0:
         raise FileNotFoundError("No input video paths provided.")
 
-    # Create a temporary .ffconcat file to list the input video paths
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".ffconcat", delete=False) as tmp_concatenate_file:
-        tmp_concatenate_file.write("ffconcat version 1.0\n")
-        for input_path in input_video_paths:
-            tmp_concatenate_file.write(f"file '{str(input_path.resolve())}'\n")
-        tmp_concatenate_file.flush()
-        tmp_concatenate_path = tmp_concatenate_file.name
-
-    # Create input and output containers
-    input_container = av.open(
-        tmp_concatenate_path, mode="r", format="concat", options={"safe": "0"}
-    )  # safe = 0 allows absolute paths as well as relative paths
-
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
-        tmp_output_video_path = tmp_named_file.name
-
-    output_container = av.open(
-        tmp_output_video_path, mode="w", options={"movflags": "faststart"}
-    )  # faststart is to move the metadata to the beginning of the file to speed up loading
-
-    # Replicate input streams in output container
-    stream_map = {}
-    for input_stream in input_container.streams:
-        if input_stream.type in ("video", "audio", "subtitle"):  # only copy compatible streams
-            stream_map[input_stream.index] = output_container.add_stream_from_template(
-                template=input_stream, opaque=True
-            )
-
-            # set the time base to the input stream time base (missing in the codec context)
-            stream_map[input_stream.index].time_base = input_stream.time_base
-
-    # Demux + remux packets (no re-encode)
-    for packet in input_container.demux():
-        # Skip packets from un-mapped streams
-        if packet.stream.index not in stream_map:
-            continue
-
-        # Skip demux flushing packets
-        if packet.dts is None:
-            continue
-
-        output_stream = stream_map[packet.stream.index]
-        packet.stream = output_stream
-        output_container.mux(packet)
-
-    input_container.close()
-    output_container.close()
-    shutil.move(tmp_output_video_path, output_video_path)
-    Path(tmp_concatenate_path).unlink()
+    remux_video_files([scan_video_timeline(path) for path in input_video_paths], output_video_path)
 
 
 @dataclass
@@ -592,7 +551,7 @@ def get_video_pixel_channels(pix_fmt: str) -> int:
 
 def get_video_duration_in_s(video_path: Path | str) -> float:
     """
-    Get the duration of a video file in seconds using PyAV.
+    Get the validated frame-count duration used by video concatenation, in seconds.
 
     Args:
         video_path: Path to the video file.
@@ -600,16 +559,7 @@ def get_video_duration_in_s(video_path: Path | str) -> float:
     Returns:
         Duration of the video in seconds.
     """
-    with av.open(str(video_path)) as container:
-        # Get the first video stream
-        video_stream = container.streams.video[0]
-        # Calculate duration: stream.duration * stream.time_base gives duration in seconds
-        if video_stream.duration is not None:
-            duration = float(video_stream.duration * video_stream.time_base)
-        else:
-            # Fallback to container duration if stream duration is not available
-            duration = float(container.duration / av.time_base)
-    return duration
+    return float(scan_video_timeline(video_path).duration)
 
 
 class VideoEncodingManager:
