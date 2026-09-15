@@ -990,7 +990,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
         """
         Query dataset for indices across keys, skipping video keys.
 
-        Tries row-first [indices][key] for speed, falls back to column-first.
+        Each key is read through a single-column projection (``select_columns``)
+        so that only that column is materialised for the requested rows.
+        Row-first ``hf_dataset[indices]`` formats *every* column of every row,
+        image columns included: with a 100-step action window on an image
+        (non-video) dataset that decoded ~200 PNG frames per sample and made the
+        dataloader ~100x slower than the GPU step. Column-first
+        ``hf_dataset[key][indices]`` is no better, it formats the whole column.
 
         Args:
             query_indices: Dict mapping keys to index lists to retrieve
@@ -1008,10 +1014,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 if self._absolute_to_relative_idx is None
                 else [self._absolute_to_relative_idx[idx] for idx in q_idx]
             )
-            try:
-                result[key] = torch.stack(self.hf_dataset[relative_indices][key])
-            except (KeyError, TypeError, IndexError):
-                result[key] = torch.stack(self.hf_dataset[key][relative_indices])
+            column = self.hf_dataset.select_columns([key])
+            result[key] = torch.stack(column[relative_indices][key])
         return result
 
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
