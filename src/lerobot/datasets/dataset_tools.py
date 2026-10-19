@@ -81,6 +81,9 @@ def delete_episodes(
     episode_indices: list[int],
     output_dir: str | Path | None = None,
     repo_id: str | None = None,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    encoder_options: dict[str, str] | None = None,
 ) -> LeRobotDataset:
     """Delete episodes from a LeRobotDataset and create a new dataset.
 
@@ -89,6 +92,12 @@ def delete_episodes(
         episode_indices: List of episode indices to delete.
         output_dir: Directory to save the new dataset. If None, uses default location.
         repo_id: Repository ID for the new dataset. If None, appends "_modified" to original.
+        vcodec: Encoder used when a video file has to be re-encoded (files that mix kept and
+            deleted episodes). Pass the same codec the dataset was written with so files do
+            not end up with mixed codecs.
+        pix_fmt: Pixel format for re-encoded video files.
+        encoder_options: Extra encoder options (e.g. {"g": "2", "crf": "30"}) applied to
+            re-encoded files.
     """
     if not episode_indices:
         raise ValueError("No episodes to delete")
@@ -121,7 +130,14 @@ def delete_episodes(
 
     video_metadata = None
     if dataset.meta.video_keys:
-        video_metadata = _copy_and_reindex_videos(dataset, new_meta, episode_mapping)
+        video_metadata = _copy_and_reindex_videos(
+            dataset,
+            new_meta,
+            episode_mapping,
+            vcodec=vcodec,
+            pix_fmt=pix_fmt,
+            encoder_options=encoder_options,
+        )
 
     data_metadata = _copy_and_reindex_data(dataset, new_meta, episode_mapping)
 
@@ -569,6 +585,7 @@ def _keep_episodes_from_video_with_av(
     fps: float,
     vcodec: str = "libsvtav1",
     pix_fmt: str = "yuv420p",
+    encoder_options: dict[str, str] | None = None,
 ) -> None:
     """Keep only specified episodes from a video file using PyAV.
 
@@ -607,6 +624,8 @@ def _keep_episodes_from_video_with_av(
     # Convert fps to Fraction for PyAV compatibility.
     fps_fraction = Fraction(fps).limit_denominator(1000)
     v_out = out.add_stream(vcodec, rate=fps_fraction)
+    if encoder_options:
+        v_out.options = {str(k): str(v) for k, v in encoder_options.items()}
 
     # PyAV type stubs don't distinguish video streams from audio/subtitle streams.
     v_out.width = v_in.codec_context.width
@@ -675,6 +694,7 @@ def _copy_and_reindex_videos(
     episode_mapping: dict[int, int],
     vcodec: str = "libsvtav1",
     pix_fmt: str = "yuv420p",
+    encoder_options: dict[str, str] | None = None,
 ) -> dict[int, dict]:
     """Copy and filter video files, only re-encoding files with deleted episodes.
 
@@ -778,6 +798,7 @@ def _copy_and_reindex_videos(
                     src_dataset.meta.fps,
                     vcodec,
                     pix_fmt,
+                    encoder_options,
                 )
 
                 cumulative_ts = 0.0
