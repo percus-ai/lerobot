@@ -43,7 +43,7 @@ else:
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pretrained import PreTrainedPolicy, T
-from lerobot.policies.utils import cast_state_dict_to_model_dtypes, load_safetensors_casted_to_model
+from lerobot.policies.utils import load_safetensors_into_model
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.utils.constants import (
     ACTION,
@@ -983,54 +983,28 @@ class PI0Policy(PreTrainedPolicy):
                     revision=kwargs.get("revision"),
                     local_files_only=kwargs.get("local_files_only", False),
                 )
-                def _model_key(name: str) -> str | None:
-                    fixed = model._fix_pytorch_state_dict_keys({name: None}, model.config)
-                    if not fixed:
-                        return None
-                    key = next(iter(fixed))
-                    return key if key.startswith("model.") else f"model.{key}"
-
-                # テンソル単位で読み、その場でモデル側の dtype(推論では bfloat16)に変換する。
-                # 全体を float32 で展開しないので CPU の常駐が小さく、GPU へは変換後の値だけが渡る
-                original_state_dict = load_safetensors_casted_to_model(
-                    resolved_file, model, map_key=_model_key
-                )
-                print("✓ Loaded state dict from model.safetensors")
             except Exception as e:
                 print(f"Could not load state dict from remote files: {e}")
                 print("Returning model without loading pretrained weights")
                 return model
 
-            # First, fix any key differences # see openpi `model.py, _fix_pytorch_state_dict_keys`
-            fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
+            def _model_key(name: str) -> str | None:
+                # ファイル内の名前 → モデルの state_dict のキー(_fix_pytorch_state_dict_keys の
+                # 名前変換と "model." 接頭辞の付加を 1 本ずつ適用する)
+                fixed = model._fix_pytorch_state_dict_keys({name: None}, model.config)
+                if not fixed:
+                    return None
+                key = next(iter(fixed))
+                return key if key.startswith("model.") else f"model.{key}"
 
-            # Then add "model." prefix for all keys that don't already have it
-            remapped_state_dict = {}
-            remap_count = 0
+            # テンソル単位で読み、CPU 上でモデル側の dtype(推論では bfloat16)に変換してから直接写す。
+            # 全体を float32 で展開せず、GPU へは変換後の値だけが渡る(読み込み中の CUDA OOM 対策)。
+            # strict で足りない / 余るキーがあれば、写し終えたあとに RuntimeError(下の except で報告)
+            missing_keys, unexpected_keys = load_safetensors_into_model(
+                resolved_file, model, map_key=_model_key, strict=strict
+            )
+            print("✓ Loaded state dict from model.safetensors")
 
-            for key, value in fixed_state_dict.items():
-                if not key.startswith("model."):
-                    new_key = f"model.{key}"
-                    remapped_state_dict[new_key] = value
-                    remap_count += 1
-                else:
-                    remapped_state_dict[key] = value
-
-            if remap_count > 0:
-                print(f"Remapped {remap_count} state dict keys")
-
-            # 重みをモデルへ写す前に、CPU 上でモデル側のパラメータの dtype に合わせる。この時点でモデルは
-            # config.device(推論では cuda)に居て、推論では paligemma_with_expert 配下が bfloat16 になっている。
-            # float32 で保存した重みをそのまま load_state_dict に渡すと GPU 側で float32 の一時テンソルを
-            # 経由して丸めるため、12 GB 級 GPU では読み込み中に CUDA OOM になる。先に CPU で同じ丸めを
-            # 済ませれば GPU に載る値は同一で一時領域は要らない。学習(パラメータが float32)では何も変わらない。
-            del original_state_dict, fixed_state_dict
-            casted = cast_state_dict_to_model_dtypes(remapped_state_dict, model)
-            if casted > 0:
-                print(f"Cast {casted} tensors to the model's dtypes on CPU before loading")
-
-            # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")

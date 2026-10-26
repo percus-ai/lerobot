@@ -243,57 +243,59 @@ def validate_visual_features_consistency(
         raise_feature_mismatch_error(provided_visuals, expected_visuals)
 
 
-def cast_state_dict_to_model_dtypes(state_dict: dict[str, torch.Tensor], model: nn.Module) -> int:
-    """state_dict の浮動小数テンソルを、同名のパラメータ / バッファの dtype に合わせて変換する(その場で置き換え)。
+@torch.no_grad()
+def load_safetensors_into_model(
+    path: str | Path,
+    model: nn.Module,
+    *,
+    map_key: Callable[[str], str | None],
+    strict: bool = True,
+) -> tuple[list[str], list[str]]:
+    """safetensors をテンソル単位で読み、モデル側の dtype に変換してからパラメータ / バッファへ直接写す。
 
-    変換は state_dict のテンソルが居るデバイス(通常 CPU)で行う。``load_state_dict`` が写すときに行う
-    dtype 変換と同じ丸め(最近接偶数)なので、モデルに載る値は変わらない。先に変換しておくと、
-    float32 で保存した重みを bfloat16 のモデル(GPU 上)へ写すときに GPU 側で float32 の一時テンソルを
-    経由せずに済み、12 GB 級 GPU での読み込み中の CUDA OOM を避けられる。dtype が既に一致している
-    (学習時の float32 など)場合は何もしない。戻り値は変換した個数。
-    """
-    targets = {name: param.dtype for name, param in model.named_parameters()}
-    targets.update({name: buf.dtype for name, buf in model.named_buffers()})
-    casted = 0
-    for key in list(state_dict.keys()):
-        tensor = state_dict[key]
-        target = targets.get(key)
-        if target is None or not torch.is_tensor(tensor) or not tensor.is_floating_point():
-            continue
-        if not target.is_floating_point or tensor.dtype == target:
-            continue
-        state_dict[key] = tensor.to(dtype=target)
-        casted += 1
-    return casted
+    ``load_state_dict`` に全体を渡す読み方だと、float32 で保存した重みは (1) CPU 上で全体が展開され、
+    (2) bfloat16 のモデル(GPU 上)へ写すときに GPU 側で float32 の一時テンソルを経由して丸められる。
+    π0.5 の float32 保存(14.5 GB)は (2) で 12 GB 級 GPU の読み込み中に CUDA OOM になる。
+    ここでは 1 本ずつ読み、同名のパラメータ / バッファの dtype に CPU 上で変換してから ``copy_`` で
+    写すので、GPU の一時領域は要らず、CPU の常駐もテンソル 1 本分で済む。丸めは ``load_state_dict`` が
+    行う dtype 変換と同じ最近接偶数なので、載る値は変わらない。
 
-
-def load_safetensors_casted_to_model(
-    path: str | Path, model: nn.Module, *, map_key: Callable[[str], str | None]
-) -> dict[str, torch.Tensor]:
-    """safetensors をテンソル単位で読み、その場でモデル側の同名パラメータ / バッファの dtype に変換して返す。
-
-    ``map_key(name)`` はファイル内の名前をモデルの state_dict のキーに写す(対象外なら None)。
-    ``safetensors.torch.load_file`` は全テンソルを 1 つの共有バッファに展開するので、float32 保存の
-    重みは変換後も元の float32 全体が居座る。ここでは 1 本ずつ読んで変換するので、CPU の常駐は
-    「変換後の合計 + テンソル 1 本」程度で済む。変換の規則は ``cast_state_dict_to_model_dtypes`` と同じ。
-    戻り値のキーはファイル内の名前のまま(呼び出し側の key 変換はそのまま通る)。
+    ``map_key(name)`` はファイル内の名前をモデルの state_dict のキーに写す(捨てるなら None)。
+    戻り値は ``load_state_dict`` と同じ (missing_keys, unexpected_keys)。``strict`` のときに
+    どちらかがあれば、写し終えてから RuntimeError を投げる(``load_state_dict`` と同じ順)。
     """
     from safetensors import safe_open
 
-    targets = {name: param.dtype for name, param in model.named_parameters()}
-    targets.update({name: buf.dtype for name, buf in model.named_buffers()})
-    out: dict[str, torch.Tensor] = {}
+    targets = model.state_dict()          # パラメータ / バッファと記憶域を共有する(copy_ で書ける)
+    loaded: set[str] = set()
+    unexpected: list[str] = []
     with safe_open(str(path), framework="pt", device="cpu") as f:
         for name in f.keys():
-            tensor = f.get_tensor(name)
             key = map_key(name)
-            target = targets.get(key) if key is not None else None
-            if (
-                target is not None
-                and tensor.is_floating_point()
-                and target.is_floating_point
-                and tensor.dtype != target
-            ):
-                tensor = tensor.to(dtype=target)
-            out[name] = tensor
-    return out
+            if key is None:
+                continue
+            dst = targets.get(key)
+            if dst is None:
+                unexpected.append(key)
+                continue
+            src = f.get_tensor(name)
+            if tuple(src.shape) != tuple(dst.shape):
+                raise RuntimeError(
+                    f"size mismatch for {key}: copying a param with shape {tuple(src.shape)} from checkpoint, "
+                    f"the shape in current model is {tuple(dst.shape)}."
+                )
+            if src.is_floating_point() and dst.is_floating_point() and src.dtype != dst.dtype:
+                src = src.to(dtype=dst.dtype)   # CPU で丸める(load_state_dict と同じ丸め)
+            dst.copy_(src)
+            loaded.add(key)
+    missing = [key for key in targets if key not in loaded]
+    if strict and (missing or unexpected):
+        lines = []
+        if missing:
+            lines.append("Missing key(s) in state_dict: " + ", ".join(f'"{k}"' for k in missing) + ". ")
+        if unexpected:
+            lines.append("Unexpected key(s) in state_dict: " + ", ".join(f'"{k}"' for k in unexpected) + ". ")
+        raise RuntimeError(
+            f"Error(s) in loading state_dict for {model.__class__.__name__}:\n\t" + "\n\t".join(lines)
+        )
+    return missing, unexpected
