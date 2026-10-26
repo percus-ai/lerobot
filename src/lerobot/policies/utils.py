@@ -16,6 +16,8 @@
 
 import logging
 from collections import deque
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -239,3 +241,59 @@ def validate_visual_features_consistency(
     provided_visuals = {k for k, v in features.items() if v.type == FeatureType.VISUAL}
     if not provided_visuals.issubset(expected_visuals):
         raise_feature_mismatch_error(provided_visuals, expected_visuals)
+
+
+def cast_state_dict_to_model_dtypes(state_dict: dict[str, torch.Tensor], model: nn.Module) -> int:
+    """state_dict の浮動小数テンソルを、同名のパラメータ / バッファの dtype に合わせて変換する(その場で置き換え)。
+
+    変換は state_dict のテンソルが居るデバイス(通常 CPU)で行う。``load_state_dict`` が写すときに行う
+    dtype 変換と同じ丸め(最近接偶数)なので、モデルに載る値は変わらない。先に変換しておくと、
+    float32 で保存した重みを bfloat16 のモデル(GPU 上)へ写すときに GPU 側で float32 の一時テンソルを
+    経由せずに済み、12 GB 級 GPU での読み込み中の CUDA OOM を避けられる。dtype が既に一致している
+    (学習時の float32 など)場合は何もしない。戻り値は変換した個数。
+    """
+    targets = {name: param.dtype for name, param in model.named_parameters()}
+    targets.update({name: buf.dtype for name, buf in model.named_buffers()})
+    casted = 0
+    for key in list(state_dict.keys()):
+        tensor = state_dict[key]
+        target = targets.get(key)
+        if target is None or not torch.is_tensor(tensor) or not tensor.is_floating_point():
+            continue
+        if not target.is_floating_point or tensor.dtype == target:
+            continue
+        state_dict[key] = tensor.to(dtype=target)
+        casted += 1
+    return casted
+
+
+def load_safetensors_casted_to_model(
+    path: str | Path, model: nn.Module, *, map_key: Callable[[str], str | None]
+) -> dict[str, torch.Tensor]:
+    """safetensors をテンソル単位で読み、その場でモデル側の同名パラメータ / バッファの dtype に変換して返す。
+
+    ``map_key(name)`` はファイル内の名前をモデルの state_dict のキーに写す(対象外なら None)。
+    ``safetensors.torch.load_file`` は全テンソルを 1 つの共有バッファに展開するので、float32 保存の
+    重みは変換後も元の float32 全体が居座る。ここでは 1 本ずつ読んで変換するので、CPU の常駐は
+    「変換後の合計 + テンソル 1 本」程度で済む。変換の規則は ``cast_state_dict_to_model_dtypes`` と同じ。
+    戻り値のキーはファイル内の名前のまま(呼び出し側の key 変換はそのまま通る)。
+    """
+    from safetensors import safe_open
+
+    targets = {name: param.dtype for name, param in model.named_parameters()}
+    targets.update({name: buf.dtype for name, buf in model.named_buffers()})
+    out: dict[str, torch.Tensor] = {}
+    with safe_open(str(path), framework="pt", device="cpu") as f:
+        for name in f.keys():
+            tensor = f.get_tensor(name)
+            key = map_key(name)
+            target = targets.get(key) if key is not None else None
+            if (
+                target is not None
+                and tensor.is_floating_point()
+                and target.is_floating_point
+                and tensor.dtype != target
+            ):
+                tensor = tensor.to(dtype=target)
+            out[name] = tensor
+    return out
