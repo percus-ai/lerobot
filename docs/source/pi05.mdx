@@ -82,6 +82,8 @@ python src/lerobot/scripts/lerobot_train.py\
   - [lerobot/pi05_base](https://huggingface.co/lerobot/pi05_base)
   - [lerobot/pi05_libero](https://huggingface.co/lerobot/pi05_libero) (specifically trained on the Libero dataset)
 
+Gradient checkpointing recomputes each joint transformer layer during backward; the complete transformer is not wrapped in an additional checkpoint. Image and projection checkpointing remain enabled. This preserves the trainable parameters and loss while avoiding duplicate transformer recomputation. If GPU memory permits, `--policy.gradient_checkpointing=false` avoids checkpoint recomputation entirely. Compare throughput at the same batch size, and measure compilation startup separately from steady training updates.
+
 If your dataset is not converted with `quantiles`, you can convert it with the following command:
 
 ```bash
