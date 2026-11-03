@@ -16,6 +16,8 @@
 
 import logging
 from collections import deque
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -239,3 +241,61 @@ def validate_visual_features_consistency(
     provided_visuals = {k for k, v in features.items() if v.type == FeatureType.VISUAL}
     if not provided_visuals.issubset(expected_visuals):
         raise_feature_mismatch_error(provided_visuals, expected_visuals)
+
+
+@torch.no_grad()
+def load_safetensors_into_model(
+    path: str | Path,
+    model: nn.Module,
+    *,
+    map_key: Callable[[str], str | None],
+    strict: bool = True,
+) -> tuple[list[str], list[str]]:
+    """safetensors をテンソル単位で読み、モデル側の dtype に変換してからパラメータ / バッファへ直接写す。
+
+    ``load_state_dict`` に全体を渡す読み方だと、float32 で保存した重みは (1) CPU 上で全体が展開され、
+    (2) bfloat16 のモデル(GPU 上)へ写すときに GPU 側で float32 の一時テンソルを経由して丸められる。
+    π0.5 の float32 保存(14.5 GB)は (2) で 12 GB 級 GPU の読み込み中に CUDA OOM になる。
+    ここでは 1 本ずつ読み、同名のパラメータ / バッファの dtype に CPU 上で変換してから ``copy_`` で
+    写すので、GPU の一時領域は要らず、CPU の常駐もテンソル 1 本分で済む。丸めは ``load_state_dict`` が
+    行う dtype 変換と同じ最近接偶数なので、載る値は変わらない。
+
+    ``map_key(name)`` はファイル内の名前をモデルの state_dict のキーに写す(捨てるなら None)。
+    戻り値は ``load_state_dict`` と同じ (missing_keys, unexpected_keys)。``strict`` のときに
+    どちらかがあれば、写し終えてから RuntimeError を投げる(``load_state_dict`` と同じ順)。
+    """
+    from safetensors import safe_open
+
+    targets = model.state_dict()          # パラメータ / バッファと記憶域を共有する(copy_ で書ける)
+    loaded: set[str] = set()
+    unexpected: list[str] = []
+    with safe_open(str(path), framework="pt", device="cpu") as f:
+        for name in f.keys():
+            key = map_key(name)
+            if key is None:
+                continue
+            dst = targets.get(key)
+            if dst is None:
+                unexpected.append(key)
+                continue
+            src = f.get_tensor(name)
+            if tuple(src.shape) != tuple(dst.shape):
+                raise RuntimeError(
+                    f"size mismatch for {key}: copying a param with shape {tuple(src.shape)} from checkpoint, "
+                    f"the shape in current model is {tuple(dst.shape)}."
+                )
+            if src.is_floating_point() and dst.is_floating_point() and src.dtype != dst.dtype:
+                src = src.to(dtype=dst.dtype)   # CPU で丸める(load_state_dict と同じ丸め)
+            dst.copy_(src)
+            loaded.add(key)
+    missing = [key for key in targets if key not in loaded]
+    if strict and (missing or unexpected):
+        lines = []
+        if missing:
+            lines.append("Missing key(s) in state_dict: " + ", ".join(f'"{k}"' for k in missing) + ". ")
+        if unexpected:
+            lines.append("Unexpected key(s) in state_dict: " + ", ".join(f'"{k}"' for k in unexpected) + ". ")
+        raise RuntimeError(
+            f"Error(s) in loading state_dict for {model.__class__.__name__}:\n\t" + "\n\t".join(lines)
+        )
+    return missing, unexpected
