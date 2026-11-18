@@ -438,15 +438,18 @@ def test_groot_predict_action_chunk_forwards_n1_7_rtc_prefix(monkeypatch):
     )
 
     assert actions.shape == (1, 40, 7)
+    # 残りは 8 ステップ、重ねるのは 6 ステップ。残りの「先頭」6 個を新しいチャンクの先頭に重ねる
+    # (残りの先頭 = 次に実行する 1 ステップ)。本家は残り全体を渡すので、N1.7 本体が末尾の 6 個を
+    # 取り、2 ステップ後ろの動作が先頭に重なる。
     assert dummy_model.get_action_options == {
-        "action_horizon": 8,
+        "action_horizon": 6,
         "rtc_overlap_steps": 6,
         "rtc_frozen_steps": 3,
         "rtc_ramp_rate": 6.0,
     }
-    assert dummy_model.forward_inputs["action"].shape == (1, 8, 132)
-    torch.testing.assert_close(dummy_model.forward_inputs["action"][0, :, :7], prev_chunk)
-    torch.testing.assert_close(dummy_model.forward_inputs["action"][0, :, 7:], torch.zeros(8, 125))
+    assert dummy_model.forward_inputs["action"].shape == (1, 6, 132)
+    torch.testing.assert_close(dummy_model.forward_inputs["action"][0, :, :7], prev_chunk[:6])
+    torch.testing.assert_close(dummy_model.forward_inputs["action"][0, :, 7:], torch.zeros(6, 125))
 
 
 def test_groot_predict_action_chunk_strips_padded_n1_7_rtc_prefix(monkeypatch):

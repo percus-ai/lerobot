@@ -26,6 +26,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from . import _dtype_codec  # noqa: F401  (torch.dtype の読み書きを登録する)
@@ -324,6 +325,9 @@ class GrootConfig(PreTrainedConfig):
     # Inference-time knob: Real-Time Chunking (RTC) overlap-blend ramp rate, used when the RTC engine
     # supplies a previous-chunk prefix. Higher values blend the overlapping prefix more aggressively.
     # None keeps the checkpoint value (GR00T N1.7 default: 6.0).
+    # Real-Time Chunking の設定。推論側 (ゲートウェイ) が有効にして、実行する区間の長さを書き込む。
+    # N1.7 は前のチャンクの残りを、モデル本体の重なり誘導 (rtc_overlap_steps / rtc_frozen_steps) へ渡す。
+    rtc_config: RTCConfig | None = None
     rtc_ramp_rate: float | None = None
 
     # Inference-time knob: Whether to request the flash-attention-2 kernel for the Qwen3-VL backbone.

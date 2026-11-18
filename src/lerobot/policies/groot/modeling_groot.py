@@ -24,6 +24,7 @@ orchestration are handled by LeRobot's standard training stack.
 
 import builtins
 import dataclasses
+import json
 import logging
 import os
 from collections import deque
@@ -33,10 +34,11 @@ from typing import TYPE_CHECKING, Any, TypeVar
 import torch
 from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
-from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub.errors import EntryNotFoundError, HfHubHTTPError
 from torch import Tensor
 from typing_extensions import Unpack
 
+from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.utils.constants import ACTION, OBS_IMAGES
 
@@ -52,7 +54,7 @@ from .configuration_groot import (
     infer_groot_n1_7_action_execution_horizon,
     infer_groot_n1_7_action_horizon,
 )
-from .groot_n1_7 import GR00TN17, _tie_unused_qwen_lm_head
+from .groot_n1_7 import GR00TN17, GR00TN17Config, _tie_unused_qwen_lm_head
 
 if TYPE_CHECKING or _transformers_available:
     from transformers.trainer_pt_utils import get_parameter_names
@@ -62,6 +64,11 @@ else:
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound="GrootPolicy")
+
+# 学習済みチェックポイントに同梱する、N1.7 本体 (土台 + 動作ヘッド) の構成。
+# これがあれば、読み込みのときにベースモデル (nvidia/GR00T-N1.7-3B、約 7GB) を取りに行かず、
+# チェックポイントのフォルダだけでモデルを組み立てられる (π0 / π0.5 と同じ持ち方)。
+GROOT_MODEL_CONFIG_FILENAME = "groot_model_config.json"
 
 
 class GrootPolicy(PreTrainedPolicy):
@@ -80,6 +87,9 @@ class GrootPolicy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
+
+        # 学習済みチェックポイントから読むときは、同梱の構成 (from_pretrained が渡す) で組み立てる。
+        self._native_model_config: dict[str, Any] | None = kwargs.pop("groot_model_config", None)
 
         # Initialize GR00T model using ported components
         self._groot_model = self._create_groot_model()
@@ -107,24 +117,83 @@ class GrootPolicy(PreTrainedPolicy):
         if self.config.rtc_ramp_rate is not None:
             model_kwargs["rtc_ramp_rate"] = self.config.rtc_ramp_rate
 
-        model = GR00TN17.from_pretrained(
-            **model_kwargs,
-            tune_vlln=self.config.tune_vlln,
-            transformers_loading_kwargs={"trust_remote_code": True},
-        )
+        if self._native_model_config is not None:
+            model = self._build_model_from_native_config(self._native_model_config, model_kwargs)
+        else:
+            model = GR00TN17.from_pretrained(
+                **model_kwargs,
+                tune_vlln=self.config.tune_vlln,
+                transformers_loading_kwargs={"trust_remote_code": True},
+            )
         backbone = getattr(model, "backbone", None)
         qwen_model = getattr(backbone, "model", None)
         if qwen_model is not None:
             _tie_unused_qwen_lm_head(qwen_model)
-        if self.config.dtype == torch.float32:
-            self._cast_model_parameters_to_fp32(model)
+        self._apply_parameter_dtype(model)
         return model
+
+    def _build_model_from_native_config(
+        self, native_config: dict[str, Any], model_kwargs: dict[str, Any]
+    ) -> GR00TN17:
+        """チェックポイント同梱の構成から N1.7 本体を組み立てる (重みは後で state dict から載る)。
+
+        ベースモデルの重みもネットワークも使わない。学習するかどうかの指定は、ベースモデルから
+        読む経路 (GR00TN17.from_pretrained) と同じ順で当てる。
+        """
+        from transformers.modeling_utils import no_init_weights
+
+        model_config = GR00TN17Config.from_dict(dict(native_config))
+        model_config.tune_llm = self.config.tune_llm
+        model_config.tune_visual = self.config.tune_visual
+        for key in ("tune_top_llm_layers", "use_flash_attention", "num_inference_timesteps", "rtc_ramp_rate"):
+            if key in model_kwargs:
+                setattr(model_config, key, model_kwargs[key])
+        # 全部の重みをこの後チェックポイントから載せるので、初期値の計算は省く。
+        with no_init_weights():
+            model = GR00TN17(model_config, load_backbone_weights=False)
+        model.backbone.set_trainable_parameters(
+            tune_visual=self.config.tune_visual,
+            tune_llm=self.config.tune_llm,
+            tune_top_llm_layers=model.config.tune_top_llm_layers,
+        )
+        model.action_head.set_trainable_parameters(
+            tune_projector=self.config.tune_projector,
+            tune_diffusion_model=self.config.tune_diffusion_model,
+            tune_vlln=self.config.tune_vlln,
+        )
+        return model
+
+    def _apply_parameter_dtype(self, model: torch.nn.Module) -> None:
+        """config.dtype の精度で重みを持つ。None ならチェックポイントのまま。
+
+        float32 は学習の既定 (重み fp32・計算は bf16 の自動キャスト)。bfloat16 は推論でメモリを
+        半分にするための指定で、fp32 で保存された重みは読み込みのときにこの精度へ変換される。
+        """
+        dtype = self.config.dtype
+        if dtype is None:
+            return
+        if dtype == torch.float32:
+            self._cast_model_parameters_to_fp32(model)
+        elif dtype == torch.bfloat16:
+            model.to(torch.bfloat16)
+        else:
+            raise ValueError(f"GR00T supports dtype float32 or bfloat16 (got {dtype}).")
 
     @staticmethod
     def _cast_model_parameters_to_fp32(model: torch.nn.Module) -> None:
         for parameter in model.parameters():
             if parameter.is_floating_point():
                 parameter.data = parameter.data.to(torch.float32)
+
+    def _save_pretrained(self, save_directory: Path) -> None:
+        """重みと設定に加えて、N1.7 本体の構成も保存する (読み込みでベースモデルを要らなくする)。"""
+        super()._save_pretrained(save_directory)
+        native_config = getattr(self._groot_model, "config", None)
+        if not hasattr(native_config, "to_dict"):
+            raise RuntimeError("GR00T model has no serializable config; cannot save a self-contained checkpoint.")
+        (Path(save_directory) / GROOT_MODEL_CONFIG_FILENAME).write_text(
+            json.dumps(native_config.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
 
     @staticmethod
     def _build_weight_decay_parameter_groups(model: torch.nn.Module) -> list[dict[str, Any]]:
@@ -228,6 +297,27 @@ class GrootPolicy(PreTrainedPolicy):
         if is_finetuned_checkpoint:
             # This is a fine-tuned LeRobot checkpoint - use parent class loading
             logger.info("Detected fine-tuned LeRobot checkpoint, loading with state dict...")
+            if config is None:
+                config = PreTrainedConfig.from_pretrained(
+                    pretrained_name_or_path=pretrained_name_or_path,
+                    force_download=force_download,
+                    resume_download=resume_download,
+                    proxies=proxies,
+                    token=token,
+                    cache_dir=cache_dir,
+                    local_files_only=local_files_only,
+                    revision=revision,
+                )
+            native_model_config = cls._read_native_model_config(
+                model_id,
+                revision=revision,
+                cache_dir=cache_dir,
+                token=token,
+                local_files_only=local_files_only,
+            )
+            if native_model_config is not None:
+                # 同梱の構成で組み立てる。ベースモデルは取りに行かない。
+                kwargs["groot_model_config"] = native_model_config
             return super().from_pretrained(
                 pretrained_name_or_path=pretrained_name_or_path,
                 config=config,
@@ -286,6 +376,43 @@ class GrootPolicy(PreTrainedPolicy):
 
         policy.eval()
         return policy
+
+    @staticmethod
+    def _read_native_model_config(
+        model_id: str,
+        *,
+        revision: str | None,
+        cache_dir: str | Path | None,
+        token: str | bool | None,
+        local_files_only: bool,
+    ) -> dict[str, Any] | None:
+        """チェックポイントに同梱された N1.7 本体の構成を読む。
+
+        同梱されていないチェックポイント (本家 LeRobot で学習した物) は None を返し、呼び出し側は
+        本家と同じく base_model_path からベースモデルを読んで重みを上書きする。
+        """
+        if os.path.isdir(model_id):
+            path = Path(model_id) / GROOT_MODEL_CONFIG_FILENAME
+            if not path.is_file():
+                return None
+        else:
+            try:
+                path = Path(
+                    hf_hub_download(
+                        repo_id=model_id,
+                        filename=GROOT_MODEL_CONFIG_FILENAME,
+                        revision=revision,
+                        cache_dir=cache_dir,
+                        token=token,
+                        local_files_only=local_files_only,
+                    )
+                )
+            except EntryNotFoundError:
+                return None
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError(f"{GROOT_MODEL_CONFIG_FILENAME} must contain a JSON object: {path}")
+        return loaded
 
     def get_optim_params(self) -> list[dict[str, Any]]:
         """Isaac-GR00T excludes biases and normalization parameters from weight decay."""
@@ -438,6 +565,13 @@ class GrootPolicy(PreTrainedPolicy):
         except (TypeError, ValueError):
             frozen_steps = 0
         frozen_steps = max(0, min(frozen_steps, overlap_steps))
+
+        # prev_chunk_left_over は「前のチャンクのうち、まだ実行していない分」で、先頭が次に実行する
+        # 1 ステップ (π0 / π0.5 の RTC と同じ並び)。N1.7 本体は渡された列の「末尾 overlap 個」を
+        # 新しいチャンクの先頭に重ねるので、残りが overlap より長いと後ろ側の動作が先頭に重なり、
+        # 時刻がずれる。先頭の overlap 個だけを渡して、列の先頭と新しいチャンクの先頭を揃える。
+        prev_actions = prev_actions[:, :overlap_steps, :]
+        action_horizon = overlap_steps
 
         options: dict[str, object] = {
             "action_horizon": action_horizon,
