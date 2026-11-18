@@ -189,6 +189,8 @@ class ProcessorConfigKwargs(TypedDict, total=False):
         preprocessor_overrides: A dictionary of overrides for the preprocessor configuration.
         postprocessor_overrides: A dictionary of overrides for the postprocessor configuration.
         dataset_stats: Dataset statistics for normalization.
+        dataset_meta: Dataset metadata. Only forwarded to policies whose processors need it
+            (GR00T reads feature names and relative-action statistics from it).
     """
 
     preprocessor_config_filename: str | None
@@ -196,6 +198,7 @@ class ProcessorConfigKwargs(TypedDict, total=False):
     preprocessor_overrides: dict[str, Any] | None
     postprocessor_overrides: dict[str, Any] | None
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None
+    dataset_meta: Any | None
 
 
 def make_pre_post_processors(
@@ -231,29 +234,24 @@ def make_pre_post_processors(
             policy configuration type.
     """
     if pretrained_path:
-        # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
-            # GROOT handles normalization in groot_pack_inputs_v3 step
-            # Need to override both stats AND normalize_min_max since saved config might be empty
-            preprocessor_overrides = {}
-            postprocessor_overrides = {}
-            preprocessor_overrides["groot_pack_inputs_v3"] = {
-                "stats": kwargs.get("dataset_stats"),
-                "normalize_min_max": True,
-            }
-            preprocessor_overrides["groot_eagle_collate_v3"] = {
-                "image_processor_device": policy_cfg.device,
-            }
+            # GR00T N1.7 は正規化と VLM の入力作りを専用の手順で行う。素の N1.7 チェックポイントは
+            # 保存済みの前処理を持たないので、チェックポイント同梱の統計から組み立てる。
+            from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors_from_pretrained
 
-            # Also ensure postprocessing slices to env action dim and unnormalizes with dataset stats
-            env_action_dim = policy_cfg.output_features["action"].shape[0]
-            postprocessor_overrides["groot_action_unpack_unnormalize_v1"] = {
-                "stats": kwargs.get("dataset_stats"),
-                "normalize_min_max": True,
-                "env_action_dim": env_action_dim,
-            }
-            kwargs["preprocessor_overrides"] = preprocessor_overrides
-            kwargs["postprocessor_overrides"] = postprocessor_overrides
+            return make_groot_pre_post_processors_from_pretrained(
+                policy_cfg,
+                str(pretrained_path),
+                revision=pretrained_revision,
+                dataset_stats=kwargs.get("dataset_stats"),
+                dataset_meta=kwargs.get("dataset_meta"),
+                preprocessor_overrides=kwargs.get("preprocessor_overrides"),
+                postprocessor_overrides=kwargs.get("postprocessor_overrides"),
+                preprocessor_config_filename=kwargs.get("preprocessor_config_filename")
+                or f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
+                postprocessor_config_filename=kwargs.get("postprocessor_config_filename")
+                or f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json",
+            )
 
         hub_revision_kwargs = {"revision": pretrained_revision} if pretrained_revision else {}
         return (
@@ -358,6 +356,7 @@ def make_pre_post_processors(
         processors = make_groot_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
+            dataset_meta=kwargs.get("dataset_meta"),
         )
     elif isinstance(policy_cfg, XVLAConfig):
         from lerobot.policies.xvla.processor_xvla import (
