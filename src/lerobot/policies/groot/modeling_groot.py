@@ -617,9 +617,14 @@ class GrootPolicy(PreTrainedPolicy):
         batch: dict[str, Tensor],
         *,
         noise: Tensor | None = None,
+        num_steps: int | None = None,
         **kwargs: Unpack[RTCActionSelectKwargs],
     ) -> Tensor:
         """Predict a chunk of actions for inference by delegating to Isaac-GR00T.
+
+        `num_steps` sets the number of flow-matching denoising steps for this call (the same
+        argument pi0 / pi05 take). None keeps the model's value (`num_inference_timesteps`,
+        4 in the released N1.7 checkpoints).
 
         Returns a tensor of shape (B, n_action_steps, action_dim).
 
@@ -640,6 +645,11 @@ class GrootPolicy(PreTrainedPolicy):
             inference_delay=kwargs.get("inference_delay"),
             prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
         )
+
+        if num_steps is not None:
+            if int(num_steps) < 1:
+                raise ValueError(f"num_steps must be >= 1, got {num_steps}")
+            groot_options = {**(groot_options or {}), "num_inference_timesteps": int(num_steps)}
 
         # Get device from model parameters
         device = get_device_from_parameters(self)

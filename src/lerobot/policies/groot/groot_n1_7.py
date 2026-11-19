@@ -666,6 +666,12 @@ class GR00TN17ActionHead(nn.Module):
         vl_embeds = backbone_features
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
+        # The caller can set the number of denoising steps for this call; None keeps the model's value.
+        num_inference_timesteps = self.num_inference_timesteps
+        if options is not None and options.get("num_inference_timesteps") is not None:
+            num_inference_timesteps = int(options["num_inference_timesteps"])
+            if num_inference_timesteps < 1:
+                raise ValueError(f"num_inference_timesteps must be >= 1, got {num_inference_timesteps}")
         if noise is None:
             actions = sample_noise(
                 (batch_size, self.config.action_horizon, self.action_dim), device, dtype=vl_embeds.dtype
@@ -696,7 +702,7 @@ class GR00TN17ActionHead(nn.Module):
         def denoise_step(actions: torch.Tensor, time_tensor: torch.Tensor, t_step: int) -> torch.Tensor:
             # Bucket off the solver's step counter, not its float32 time: the buckets keep being
             # derived from the exact `t_step / num_inference_timesteps`, without a device sync.
-            t_cont = t_step / float(self.num_inference_timesteps)
+            t_cont = t_step / float(num_inference_timesteps)
             t_discretized = int(t_cont * self.num_timestep_buckets)
             timesteps_tensor = torch.full(size=(batch_size,), fill_value=t_discretized, device=device)
             action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
@@ -725,7 +731,7 @@ class GR00TN17ActionHead(nn.Module):
         actions = euler_integrate(
             denoise_step,
             actions,
-            self.num_inference_timesteps,
+            num_inference_timesteps,
             convention=FlowConvention.NOISE_AT_ZERO,
             step_aware=True,
             velocity_scale=vel_strength,

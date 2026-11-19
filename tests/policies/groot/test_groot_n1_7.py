@@ -452,6 +452,85 @@ def test_groot_predict_action_chunk_forwards_n1_7_rtc_prefix(monkeypatch):
     torch.testing.assert_close(dummy_model.forward_inputs["action"][0, :, 7:], torch.zeros(6, 125))
 
 
+def test_groot_predict_action_chunk_passes_the_number_of_denoising_steps(monkeypatch):
+    pytest.importorskip("transformers")
+
+    from lerobot.policies.groot.groot_n1_7 import GR00TN17
+
+    dummy_model = _DummyGrootModel()
+    monkeypatch.setattr(GR00TN17, "from_pretrained", classmethod(lambda cls, **kwargs: dummy_model))
+    policy = GrootPolicy(_groot_config())
+
+    # 指定しなければ今までどおり (モデルの回数のまま。options は渡さない)。
+    policy.predict_action_chunk({"state": torch.zeros(1, 1, 132)})
+    assert dummy_model.get_action_options is None
+
+    policy.predict_action_chunk({"state": torch.zeros(1, 1, 132)}, num_steps=10)
+    assert dummy_model.get_action_options == {"num_inference_timesteps": 10}
+
+    with pytest.raises(ValueError, match="num_steps"):
+        policy.predict_action_chunk({"state": torch.zeros(1, 1, 132)}, num_steps=0)
+
+
+def test_groot_predict_action_chunk_passes_the_number_of_denoising_steps_with_rtc(monkeypatch):
+    pytest.importorskip("transformers")
+
+    from lerobot.policies.groot.groot_n1_7 import GR00TN17
+
+    dummy_model = _DummyGrootModel()
+    monkeypatch.setattr(GR00TN17, "from_pretrained", classmethod(lambda cls, **kwargs: dummy_model))
+    policy = GrootPolicy(_groot_config())
+    policy.config.rtc_config = SimpleNamespace(execution_horizon=6)
+
+    policy.predict_action_chunk(
+        {"state": torch.zeros(1, 1, 132)},
+        num_steps=8,
+        inference_delay=3,
+        prev_chunk_left_over=torch.arange(8 * 7, dtype=torch.float32).view(8, 7),
+    )
+    assert dummy_model.get_action_options == {
+        "action_horizon": 6,
+        "rtc_overlap_steps": 6,
+        "rtc_frozen_steps": 3,
+        "rtc_ramp_rate": 6.0,
+        "num_inference_timesteps": 8,
+    }
+
+
+@pytest.mark.parametrize("options, expected", [(None, 4), ({}, 4), ({"num_inference_timesteps": 10}, 10)])
+def test_n1_7_action_head_integrates_with_the_requested_number_of_steps(monkeypatch, options, expected):
+    pytest.importorskip("transformers")
+
+    from lerobot.policies.groot import groot_n1_7
+    from lerobot.policies.groot.groot_n1_7 import GR00TN17ActionHead
+
+    seen = {}
+
+    def fake_integrate(step_fn, actions, num_steps, **kwargs):
+        seen["num_steps"] = num_steps
+        return actions
+
+    monkeypatch.setattr(groot_n1_7, "euler_integrate", fake_integrate)
+    head = SimpleNamespace(
+        config=SimpleNamespace(action_horizon=16),
+        action_dim=7,
+        num_inference_timesteps=4,
+    )
+    out = GR00TN17ActionHead.get_action_with_features(
+        head,
+        backbone_features=torch.zeros(1, 3, 8),
+        state_features=torch.zeros(1, 1, 8),
+        embodiment_id=torch.zeros(1, dtype=torch.long),
+        backbone_output=SimpleNamespace(),
+        action_input={},
+        options=options,
+    )
+    assert seen["num_steps"] == expected
+    assert out["action_pred"].shape == (1, 16, 7)
+    # モデルが持っている回数そのものは変えない (次の呼び出しに持ち越さない)。
+    assert head.num_inference_timesteps == 4
+
+
 def test_groot_predict_action_chunk_strips_padded_n1_7_rtc_prefix(monkeypatch):
     pytest.importorskip("transformers")
 
